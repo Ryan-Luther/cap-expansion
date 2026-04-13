@@ -331,6 +331,10 @@
                                     <div class="flex items-baseline gap-1"><p id="peak-unserved-energy-output" class="text-lg font-bold text-white">0</p><span class="text-[10px] text-prism-muted">MW</span></div>
                                 </div>
                                 <div class="bg-prism-input border border-prism-border p-3 rounded-sm shadow-sm">
+                                    <h3 class="text-[10px] font-bold uppercase tracking-wider text-prism-muted mb-1">Peak Load</h3>
+                                    <div class="flex items-baseline gap-1"><p id="peak-load-output" class="text-lg font-bold text-white">0.0</p><span class="text-[10px] text-prism-muted">GW</span></div>
+                                </div>
+                                <div class="bg-prism-input border border-prism-border p-3 rounded-sm shadow-sm">
                                     <h3 class="text-[10px] font-bold uppercase tracking-wider text-prism-muted mb-1 flex items-center">Capacity Market Reserve Margin<span class="info-tooltip">i<span class="tooltip-text">ELCC-weighted reserve margin used for capacity market pricing. Calculated as (Accredited Capacity / Peak Load - 1) × 100%, where capacity is weighted by ELCC factors.</span></span></h3>
                                     <div class="flex items-baseline gap-1"><p id="capacity-market-rm-output" class="text-lg font-bold text-white">0.0</p><span class="text-[10px] text-prism-muted">%</span></div>
                                 </div>
@@ -415,6 +419,7 @@
                                 <div class="bg-prism-card border border-prism-border rounded-sm p-3 shadow-sm md:col-span-2"><div class="relative h-96"><h3 class="text-[10px] font-bold text-prism-muted uppercase mb-2">Multi-Year Market Metrics</h3><canvas id="multiYearMetricsChart"></canvas></div></div>
                                 <div class="bg-prism-card border border-prism-border rounded-sm p-3 shadow-sm md:col-span-2"><div class="relative h-96"><h3 class="text-[10px] font-bold text-prism-muted uppercase mb-2">Multi-Year ELCC by Technology</h3><canvas id="multiYearElccChart"></canvas></div></div>
                                 <div class="bg-prism-card border border-prism-border rounded-sm p-3 shadow-sm md:col-span-2"><div class="relative h-96"><h3 class="text-[10px] font-bold text-prism-muted uppercase mb-2">Multi-Year IRR by Technology</h3><canvas id="multiYearIrrChart"></canvas></div></div>
+                                <div class="bg-prism-card border border-prism-border rounded-sm p-3 shadow-sm md:col-span-2"><div class="relative h-96"><canvas id="capMarketChart"></canvas></div></div>
                             </div>
                         </div>
                     </div>
@@ -666,9 +671,10 @@
         let hourlyData = [], dispatchAssets = [];
         let rawLoadData = null;
         let rawGenData = null;
-        let dispatchChart = null, monthlyMixChart = null, diurnalMixChart = null, dispatchCurveChart = null, multiYearCapacityChart = null, multiYearMetricsChart = null, annualCapacityAddsChart = null, multiYearElccChart = null, multiYearIrrChart = null;
+        let dispatchChart = null, monthlyMixChart = null, diurnalMixChart = null, dispatchCurveChart = null, multiYearCapacityChart = null, multiYearMetricsChart = null, annualCapacityAddsChart = null, multiYearElccChart = null, multiYearIrrChart = null, capMarketChart = null;
         let etrConfig = null; 
         let etrCapacities = {};
+        let csvBaselineCapacities = {}; // snapshot of etrCapacities after DB load, before optimizer modifies it
         let marketAssumptions = null; 
         let projectDatabase = null;
         let rawHistoricalData = null;  // Store raw historical price data
@@ -2325,6 +2331,10 @@
                     const sliderValue = parseInt(slider.value);
                     currentCapacities[tech.id] = sliderValue;
                     initialBaselineCapacities[tech.id] = sliderValue;
+                } else if (etrCapacities[tech.id] !== undefined) {
+                    // No slider (e.g. coal, oil, other) — use DB-loaded capacity from etrCapacities
+                    currentCapacities[tech.id] = etrCapacities[tech.id];
+                    initialBaselineCapacities[tech.id] = etrCapacities[tech.id];
                 }
             });
             
@@ -2349,6 +2359,7 @@
             const gasCcgtTech = generationTypes.find(t => t.id === 'new-gas-ccgt');
 
             const conf = {
+                iso: document.getElementById('isoSelector')?.value || '',
                 gasCost: parseFloat(document.getElementById('gas-fuel-cost').value),
                 bidMargin: parseFloat(document.getElementById('bid-margin').value),
                 storageDur: parseFloat(document.getElementById('storage-duration').value),
@@ -3053,17 +3064,32 @@
         }
 
         async function exportResultsToCSV() {
-            // Reset base scalars at the start of export to ensure consistent calibration
-            baseScalars = null;
-            
             if (!hourlyData.length) return showNotification("Please load data first.", true);
 
             const iso = document.getElementById('isoSelector').value;
             if (!iso) return showNotification("Please select an ISO first.", true);
-            
+
+            // For unsaved years that still require a model re-run, restore the calibration state
+            // from the saved base-year snapshot so prices are consistent with the optimization run.
+            // Saved years skip the model re-run entirely and use their stored snapshot values.
+            const baseYearOrder = ['2025', '2024'];
+            const baseScalarSource = baseYearOrder.find(y =>
+                savedData[iso]?.[y]?.metrics?.baseScalarsSnapshot != null
+            );
+            if (baseScalarSource) {
+                baseScalars = savedData[iso][baseScalarSource].metrics.baseScalarsSnapshot;
+                const sf = savedData[iso][baseScalarSource].metrics.stretchFactorSnapshot;
+                if (typeof sf === 'number') {
+                    ppConfig.stretchFactor = sf;
+                    if (fundamentalCalibrator.isTrained) fundamentalCalibrator.setParams(sf);
+                }
+            } else {
+                baseScalars = null; // No snapshot — let base years recalculate naturally
+            }
+
             // Delay between file downloads to ensure browser handles them properly
             const FILE_DOWNLOAD_DELAY_MS = 500;
-            
+
             // Update UI every N years to keep browser responsive without excessive delays
             const UI_UPDATE_INTERVAL_YEARS = 5;
             
@@ -3084,28 +3110,13 @@
                 return el ? el.textContent : defaultVal;
             };
             
-            // Helper to build a row from current UI state
-            const buildRow = (isoName, yearVal, modelResults = null) => {
-                const row = {
-                    ISO: isoName,
-                    Year: yearVal,
-                    
-                    // Installed Capacities (MW) from sliders
-                    'Onshore Wind (MW)': getInputVal('onshore-wind-slider', 0),
-                    'Offshore Wind (MW)': getInputVal('offshore-wind-slider', 0),
-                    'Solar (MW)': getInputVal('solar-slider', 0),
-                    'Hydro (MW)': getInputVal('hydro-slider', 0),
-                    'Biomass (MW)': getInputVal('biomass-slider', 0),
-                    'Geothermal (MW)': getInputVal('geothermal-slider', 0),
-                    'Nuclear (MW)': getInputVal('nuclear-slider', 0),
-                    'Coal (MW)': getInputVal('coal-slider', 0),
-                    'Oil (MW)': getInputVal('oil-slider', 0),
-                    'Other (MW)': getInputVal('other-slider', 0),
-                    'Existing Gas (MW)': getInputVal('existing-gas-slider', 0),
-                    'New Gas CCGT (MW)': getInputVal('new-gas-ccgt-slider', 0),
-                    'New Gas CT (MW)': getInputVal('new-gas-ct-slider', 0),
-                    'Storage (MW)': getInputVal('storage-slider', 0),
-                    'Net Imports (MW)': getInputVal('imports-slider', 0),
+            // Build per-year rows in long format: one row per technology per year.
+            // Returns an array of row objects (one per generationTypes entry + Tx Builds + Net Imports).
+            const buildYearRows = (isoName, yearVal, modelResults = null) => {
+                const dateStr = `1/1/${yearVal}`;
+
+                // ── Market-wide assumptions (identical for every tech row this year) ──────────
+                const mktAssumptions = {
 
                     // Market Assumptions - Commodity & Storage
                     'Gas Price ($/MMBtu)': getInputVal('gas-fuel-cost', 3.5),
@@ -3132,8 +3143,11 @@
                     'REC ACP ($/MWh)': getInputVal('rec-acp', 50),
                     'REC Floor ($/MWh)': getInputVal('rec-floor', 1.0),
                     'Energy Price Cap ($/MWh)': getInputVal('energy-price-cap', 5000),
+                    'Load Scale Factor': getInputVal('load-scale-factor', 1.0),
+                };
 
-                    // Market Results - use modelResults values if available, otherwise read from DOM
+                // ── Market-wide results (DOM fallbacks replaced by stored-snapshot patch below) ─
+                const mktResults = {
                     'Unserved Energy (MWh)': modelResults?.unservedEnergy !== undefined ? Math.round(modelResults.unservedEnergy).toString() : getText('unserved-energy-output', '0').replace(/,/g, ''),
                     'Peak Unserved Energy (MW)': modelResults?.peakUnservedEnergy !== undefined ? Math.round(modelResults.peakUnservedEnergy).toString() : getText('peak-unserved-energy-output', '0').replace(/,/g, ''),
                     'Capacity Market Reserve Margin (%)': modelResults?.marketMetrics?.planningReserveMargin !== undefined ? modelResults.marketMetrics.planningReserveMargin.toFixed(1) : getText('capacity-market-rm-output', '0'),
@@ -3144,95 +3158,67 @@
                     'REC Price ($/MWh)': modelResults?.marketMetrics?.recPrice !== undefined ? modelResults.marketMetrics.recPrice.toFixed(2) : getText('rec-price-output', '$0.00').replace('$', ''),
                     'Capacity Price ($/MW-d)': modelResults?.marketMetrics?.capacityPrice !== undefined ? modelResults.marketMetrics.capacityPrice.toFixed(2) : getText('capacity-price-output', '$0.00').replace('$', ''),
                     'Total Annual Cost ($B)': modelResults?.totalCost !== undefined ? (modelResults.totalCost / 1e9).toFixed(2) : getText('total-cost-output', '$0').replace('$', ''),
-                    'Average Energy Price ($/MWh)': modelResults?.hourlyPrices?.length > 0 ? (modelResults.hourlyPrices.reduce((a, b) => a + b, 0) / modelResults.hourlyPrices.length).toFixed(2) : getText('sim-avg-lmp', '0')
+                    'Average Energy Price ($/MWh)': modelResults?.hourlyPrices?.length > 0 ? (modelResults.hourlyPrices.reduce((a, b) => a + b, 0) / modelResults.hourlyPrices.length).toFixed(2) : getText('sim-avg-lmp', '0'),
                 };
-                
-                // Calculate and add load and net load statistics if modelResults and hourlyData are available
-                if (modelResults && modelResults.netLoad && modelResults.netLoad.length === 8760 && 
-                    hourlyData && hourlyData.length === 8760) {
-                    // Calculate load statistics from hourlyData in a single pass
-                    let peakLoad = 0;
-                    let totalLoad = 0;
+
+                // Load, net load, fuel, CO2 (computed from hourly arrays when model ran)
+                if (modelResults?.netLoad?.length === 8760 && hourlyData?.length === 8760) {
+                    let peakLoad = 0, totalLoad = 0, peakNetLoad = 0, totalNetLoad = 0;
                     for (let i = 0; i < 8760; i++) {
-                        const load = hourlyData[i].Load_MW;
-                        totalLoad += load;
-                        if (load > peakLoad) peakLoad = load;
+                        const ld = hourlyData[i].Load_MW;
+                        totalLoad += ld;
+                        if (ld > peakLoad) peakLoad = ld;
+                        const nl = modelResults.netLoad[i];
+                        totalNetLoad += nl;
+                        if (nl > peakNetLoad) peakNetLoad = nl;
                     }
-                    const avgLoad = totalLoad / 8760;
-                    
-                    // Calculate net load statistics from modelResults in a single pass
-                    let peakNetLoad = 0;
-                    let totalNetLoad = 0;
+                    mktResults['Peak Load (MW)']              = peakLoad.toFixed(2);
+                    mktResults['Average Load (MW)']           = (totalLoad / 8760).toFixed(2);
+                    mktResults['Total Annual Load (MWh)']     = totalLoad.toFixed(2);
+                    mktResults['Peak Net Load (MW)']          = peakNetLoad.toFixed(2);
+                    mktResults['Average Net Load (MW)']       = (totalNetLoad / 8760).toFixed(2);
+                    mktResults['Total Annual Net Load (MWh)'] = totalNetLoad.toFixed(2);
+
+                    let annGas = 0, annCoal = 0, annOil = 0;
+                    const egHR = modelResults.existingGasWeightedHeatRate || HEAT_RATE_EXISTING_GAS;
                     for (let i = 0; i < 8760; i++) {
-                        const netLoad = modelResults.netLoad[i];
-                        totalNetLoad += netLoad;
-                        if (netLoad > peakNetLoad) peakNetLoad = netLoad;
+                        annCoal += (modelResults.hourlyGeneration['Coal'][i]             || 0) * HEAT_RATE_COAL;
+                        annOil  += (modelResults.hourlyGeneration['Oil'][i]              || 0) * HEAT_RATE_OIL;
+                        annGas  += (modelResults.hourlyGeneration['Other'][i]            || 0) * HEAT_RATE_OTHER
+                                 + (modelResults.hourlyGeneration['Existing Gas'][i]     || 0) * egHR
+                                 + (modelResults.hourlyGeneration['New Build Gas CCGT'][i] || 0) * HEAT_RATE_CCGT
+                                 + (modelResults.hourlyGeneration['New Build Gas CT'][i]   || 0) * HEAT_RATE_CT;
                     }
-                    const avgNetLoad = totalNetLoad / 8760;
-                    
-                    row['Peak Load (MW)'] = peakLoad.toFixed(2);
-                    row['Average Load (MW)'] = avgLoad.toFixed(2);
-                    row['Total Annual Load (MWh)'] = totalLoad.toFixed(2);
-                    row['Peak Net Load (MW)'] = peakNetLoad.toFixed(2);
-                    row['Average Net Load (MW)'] = avgNetLoad.toFixed(2);
-                    row['Total Annual Net Load (MWh)'] = totalNetLoad.toFixed(2);
-                    
-                    // Calculate annual fuel consumption, CO2 emissions, and carbon costs
-                    let annualGasFuelMMBtu = 0;
-                    let annualCoalFuelMMBtu = 0;
-                    let annualOilFuelMMBtu = 0;
-                    let annualGasCO2Tons = 0;
-                    let annualCoalCO2Tons = 0;
-                    let annualOilCO2Tons = 0;
-                    
-                    // Get capacity-weighted average heat rate for existing gas from model results
-                    const existingGasHeatRate = modelResults.existingGasWeightedHeatRate || HEAT_RATE_EXISTING_GAS;
-                    
-                    for (let i = 0; i < 8760; i++) {
-                        const coalGen = modelResults.hourlyGeneration['Coal'][i] || 0;
-                        const oilGen = modelResults.hourlyGeneration['Oil'][i] || 0;
-                        const otherGen = modelResults.hourlyGeneration['Other'][i] || 0;
-                        const existingGasGen = modelResults.hourlyGeneration['Existing Gas'][i] || 0;
-                        const newGasCcgtGen = modelResults.hourlyGeneration['New Build Gas CCGT'][i] || 0;
-                        const newGasCtGen = modelResults.hourlyGeneration['New Build Gas CT'][i] || 0;
-                        
-                        // Calculate fuel consumption using defined heat rate constants
-                        // For existing gas, use capacity-weighted average heat rate from dispatch stack
-                        annualCoalFuelMMBtu += coalGen * HEAT_RATE_COAL;
-                        annualOilFuelMMBtu += oilGen * HEAT_RATE_OIL;
-                        annualGasFuelMMBtu += otherGen * HEAT_RATE_OTHER + existingGasGen * existingGasHeatRate + newGasCcgtGen * HEAT_RATE_CCGT + newGasCtGen * HEAT_RATE_CT;
-                    }
-                    
-                    // CO2 emissions (short tons)
-                    annualGasCO2Tons = annualGasFuelMMBtu * CARBON_EMISSIONS_GAS;
-                    annualCoalCO2Tons = annualCoalFuelMMBtu * CARBON_EMISSIONS_COAL;
-                    annualOilCO2Tons = annualOilFuelMMBtu * CARBON_EMISSIONS_OIL;
-                    const annualTotalCO2Tons = annualGasCO2Tons + annualCoalCO2Tons + annualOilCO2Tons;
-                    
-                    // Carbon costs
-                    const carbonCostValue = parseFloat(getInputVal('carbon-cost', 0));
-                    const annualCarbonCostDollars = annualTotalCO2Tons * carbonCostValue;
-                    
-                    row['Annual Gas Fuel (MMBtu)'] = annualGasFuelMMBtu.toFixed(0);
-                    row['Annual Coal Fuel (MMBtu)'] = annualCoalFuelMMBtu.toFixed(0);
-                    row['Annual Oil Fuel (MMBtu)'] = annualOilFuelMMBtu.toFixed(0);
-                    row['Annual Total Fuel (MMBtu)'] = (annualGasFuelMMBtu + annualCoalFuelMMBtu + annualOilFuelMMBtu).toFixed(0);
-                    row['Annual Gas CO2 (Tons)'] = annualGasCO2Tons.toFixed(0);
-                    row['Annual Coal CO2 (Tons)'] = annualCoalCO2Tons.toFixed(0);
-                    row['Annual Oil CO2 (Tons)'] = annualOilCO2Tons.toFixed(0);
-                    row['Annual Total CO2 (Tons)'] = annualTotalCO2Tons.toFixed(0);
-                    row['Annual Carbon Cost ($)'] = annualCarbonCostDollars.toFixed(0);
+                    const co2Gas = annGas * CARBON_EMISSIONS_GAS, co2Coal = annCoal * CARBON_EMISSIONS_COAL, co2Oil = annOil * CARBON_EMISSIONS_OIL;
+                    const co2Total = co2Gas + co2Coal + co2Oil;
+                    const carbonCostVal = parseFloat(getInputVal('carbon-cost', 0));
+                    mktResults['Annual Gas Fuel (MMBtu)']   = annGas.toFixed(0);
+                    mktResults['Annual Coal Fuel (MMBtu)']  = annCoal.toFixed(0);
+                    mktResults['Annual Oil Fuel (MMBtu)']   = annOil.toFixed(0);
+                    mktResults['Annual Total Fuel (MMBtu)'] = (annGas + annCoal + annOil).toFixed(0);
+                    mktResults['Annual Gas CO2 (Tons)']     = co2Gas.toFixed(0);
+                    mktResults['Annual Coal CO2 (Tons)']    = co2Coal.toFixed(0);
+                    mktResults['Annual Oil CO2 (Tons)']     = co2Oil.toFixed(0);
+                    mktResults['Annual Total CO2 (Tons)']   = co2Total.toFixed(0);
+                    mktResults['Annual Carbon Cost ($)']    = (co2Total * carbonCostVal).toFixed(0);
                 }
 
-                // Add coal ELCC from market metrics
-                const coalElcc = modelResults?.marketMetrics?.elcc?.coal;
-                row['Coal ELCC (%)'] = coalElcc !== undefined ? (coalElcc * 100).toFixed(1) : (0).toFixed(1);
+                // Coal ELCC and retirements (market-wide context, same for all tech rows)
+                const coalElccVal = modelResults?.marketMetrics?.elcc?.coal;
+                mktResults['Coal ELCC (%)'] = coalElccVal !== undefined ? (coalElccVal * 100).toFixed(1) : '0.0';
+                const yearRet = retirementsByYearIsoTech[isoName]?.[yearVal] || {};
+                mktResults['Coal Retirements (MW)']         = Math.round(yearRet['coal']         || 0);
+                mktResults['Oil Retirements (MW)']          = Math.round(yearRet['oil']          || 0);
+                mktResults['Other Retirements (MW)']        = Math.round(yearRet['other']        || 0);
+                mktResults['Existing Gas Retirements (MW)'] = Math.round(yearRet['existing-gas'] || 0);
 
-                // Calculate financials from modelResults if available (for headless mode accuracy)
+                // Merge assumptions + results into single market-wide object spread into every row
+                const marketWide = { ...mktAssumptions, ...mktResults };
+
+                // ── Per-tech financials from model (null when model skipped) ─────────────────
                 let financialsData = null;
-                if (modelResults && modelResults.marketMetrics && modelResults.hourlyGeneration && modelResults.hourlyPrices) {
-                    // Build config object from current inputs
-                    const confForFinancials = {
+                if (modelResults?.marketMetrics && modelResults?.hourlyGeneration && modelResults?.hourlyPrices) {
+                    const cfConf = {
                         gasCost: parseFloat(getInputVal('gas-fuel-cost', 3.5)),
                         txMargin: parseFloat(getInputVal('tx-margin-input', 15.0)),
                         txSuppression: parseFloat(getInputVal('tx-suppression', 1.0)),
@@ -3247,57 +3233,76 @@
                         recCapThreshold: parseFloat(getInputVal('rec-cap-threshold', 0.85)),
                         recFloorThreshold: parseFloat(getInputVal('rec-floor-threshold', 1.0))
                     };
-                    
-                    // Build capacities object from current sliders
-                    const capacitiesForFinancials = {};
-                    generationTypes.forEach(tech => {
-                        capacitiesForFinancials[tech.id] = parseInt(getInputVal(`${tech.id}-slider`, 0));
-                    });
-                    
+                    const caps = {};
+                    generationTypes.forEach(t => { caps[t.id] = parseInt(getInputVal(`${t.id}-slider`, 0)); });
                     financialsData = getFinancialsWithMetrics(
-                        modelResults.hourlyGeneration, 
-                        modelResults.hourlyPrices, 
-                        capacitiesForFinancials, 
-                        modelResults.marketMetrics, 
-                        confForFinancials, 
-                        {}, 
-                        modelResults.existingGasWeightedHeatRate
+                        modelResults.hourlyGeneration, modelResults.hourlyPrices, caps,
+                        modelResults.marketMetrics, cfConf, {}, modelResults.existingGasWeightedHeatRate
                     );
                 }
 
-                // Add per-technology financial data
+                // ── Build one row per technology ──────────────────────────────────────────────
+                const rows = [];
+
                 generationTypes.forEach(tech => {
-                    if (tech.id === 'coal') return;
-                    
-                    const prefix = tech.id === 'imports' ? 'Tx Builds' : tech.name;
+                    if (tech.id === 'imports') return; // handled separately below
                     const finData = financialsData?.[tech.id];
-                    
-                    row[`${prefix} New Build (MW)`] = getText(`new-build-${tech.id}`, '0').replace(/,/g, '');
-                    row[`${prefix} Ann Cap (MW)`] = getInputVal(`ann-cap-${tech.id}`, 0);
-                    row[`${prefix} Capex ($/kW)`] = getInputVal(`capex-${tech.id}`, 0);
-                    row[`${prefix} Opex ($/MW-Mo)`] = getInputVal(`opex-${tech.id}`, 0);
-                    row[`${prefix} Life (yrs)`] = getInputVal(`life-${tech.id}`, 0);
-                    
-                    // Use calculated values if available, otherwise fall back to DOM
-                    row[`${prefix} CF (%)`] = finData ? finData.cf.toFixed(1) : getText(`cf-${tech.id}`, '0');
-                    row[`${prefix} ELCC (%)`] = finData ? finData.elcc.toFixed(1) : getInputVal(`elcc-${tech.id}`, 0);
-                    
-                    if (tech.id === 'imports') {
-                        row[`${prefix} Energy ($/MWh)`] = getInputVal('tx-margin-input', '15.0');
-                    } else {
-                        row[`${prefix} Energy ($/MWh)`] = finData ? finData.capturedPrice.toFixed(2) : getText(`price-${tech.id}`, '0');
-                    }
-                    
-                    row[`${prefix} Cap Rev ($/MW-d)`] = finData ? finData.capRevPerMWDay.toFixed(2) : getText(`cap-rev-${tech.id}`, '0');
-                    row[`${prefix} REC Rev ($/MWh)`] = finData ? finData.recRevPerMWh.toFixed(2) : getText(`rec-rev-${tech.id}`, '0');
-                    row[`${prefix} AS Rev Adder ($/MW-Mo)`] = getInputVal(`as-rev-${tech.id}`, 0);
-                    row[`${prefix} Hurdle (%)`] = getInputVal(`hurdle-${tech.id}`, 0);
-                    row[`${prefix} IRR (%)`] = finData && !isNaN(finData.irr) ? finData.irr.toFixed(1) : getText(`irr-${tech.id}`, '0');
+                    const isCoal = (tech.id === 'coal');
+                    rows.push({
+                        ISO: isoName, Date: dateStr, Year: yearVal, Technology: tech.name,
+                        'Installed Capacity (MW)': getInputVal(`${tech.id}-slider`, 0),
+                        'New Build (MW)':            isCoal ? '' : getText(`new-build-${tech.id}`, '0').replace(/,/g, ''),
+                        'Ann Cap (MW)':              isCoal ? '' : getInputVal(`ann-cap-${tech.id}`, 0),
+                        'Capex ($/kW)':              isCoal ? '' : getInputVal(`capex-${tech.id}`, 0),
+                        'Opex ($/MW-Mo)':            isCoal ? '' : getInputVal(`opex-${tech.id}`, 0),
+                        'Life (yrs)':                isCoal ? '' : getInputVal(`life-${tech.id}`, 0),
+                        'CF (%)':                    isCoal ? '' : (finData ? finData.cf.toFixed(1)           : getText(`cf-${tech.id}`, '0')),
+                        'ELCC (%)':                  isCoal ? '' : (finData ? finData.elcc.toFixed(1)         : getInputVal(`elcc-${tech.id}`, 0)),
+                        'Energy ($/MWh)':            isCoal ? '' : (finData ? finData.capturedPrice.toFixed(2): getText(`price-${tech.id}`, '0')),
+                        'Cap Rev ($/MW-d)':          isCoal ? '' : (finData ? finData.capRevPerMWDay.toFixed(2): getText(`cap-rev-${tech.id}`, '0')),
+                        'REC Rev ($/MWh)':           isCoal ? '' : (finData ? finData.recRevPerMWh.toFixed(2) : getText(`rec-rev-${tech.id}`, '0')),
+                        'AS Rev Adder ($/MW-Mo)':    isCoal ? '' : getInputVal(`as-rev-${tech.id}`, 0),
+                        'Hurdle (%)':                isCoal ? '' : getInputVal(`hurdle-${tech.id}`, 0),
+                        'IRR (%)':                   isCoal ? '' : (finData && !isNaN(finData.irr) ? finData.irr.toFixed(1) : getText(`irr-${tech.id}`, '0')),
+                        ...marketWide
+                    });
                 });
-                
-                return row;
+
+                // Tx Builds row — imports financial data; installed capacity shown separately below
+                const impFin = financialsData?.['imports'];
+                rows.push({
+                    ISO: isoName, Date: dateStr, Year: yearVal, Technology: 'Tx Builds',
+                    'Installed Capacity (MW)': '',
+                    'New Build (MW)':           getText('new-build-imports', '0').replace(/,/g, ''),
+                    'Ann Cap (MW)':             getInputVal('ann-cap-imports', 0),
+                    'Capex ($/kW)':             getInputVal('capex-imports', 0),
+                    'Opex ($/MW-Mo)':           getInputVal('opex-imports', 0),
+                    'Life (yrs)':               getInputVal('life-imports', 0),
+                    'CF (%)':                   impFin ? impFin.cf.toFixed(1)           : getText('cf-imports', '0'),
+                    'ELCC (%)':                 impFin ? impFin.elcc.toFixed(1)         : getInputVal('elcc-imports', 0),
+                    'Energy ($/MWh)':           getInputVal('tx-margin-input', 15.0),
+                    'Cap Rev ($/MW-d)':         '',
+                    'REC Rev ($/MWh)':          '',
+                    'AS Rev Adder ($/MW-Mo)':   getInputVal('as-rev-imports', 0),
+                    'Hurdle (%)':               getInputVal('hurdle-imports', 0),
+                    'IRR (%)':                  impFin && !isNaN(impFin.irr) ? impFin.irr.toFixed(1) : getText('irr-imports', '0'),
+                    ...marketWide
+                });
+
+                // Net Imports row — current installed import capacity, no financial columns
+                rows.push({
+                    ISO: isoName, Date: dateStr, Year: yearVal, Technology: 'Net Imports',
+                    'Installed Capacity (MW)': getInputVal('imports-slider', 0),
+                    'New Build (MW)': '', 'Ann Cap (MW)': '', 'Capex ($/kW)': '', 'Opex ($/MW-Mo)': '',
+                    'Life (yrs)': '', 'CF (%)': '', 'ELCC (%)': '', 'Energy ($/MWh)': '',
+                    'Cap Rev ($/MW-d)': '', 'REC Rev ($/MWh)': '', 'AS Rev Adder ($/MW-Mo)': '',
+                    'Hurdle (%)': '', 'IRR (%)': '',
+                    ...marketWide
+                });
+
+                return rows;
             };
-            
+
             const allRows = [];
             const allHourlyRows = []; // For 8760 time series data
             const yearSelector = document.getElementById('yearSelector');
@@ -3322,6 +3327,7 @@
             allYearsForIso.sort((a, b) => parseInt(a) - parseInt(b));
             
             // Process each year (saved or not)
+            try {
             for (let i = 0; i < allYearsForIso.length; i++) {
                 const year = allYearsForIso[i];
                 exportBtn.textContent = `Exporting ${i + 1}/${allYearsForIso.length}...`;
@@ -3335,8 +3341,9 @@
                     continue;
                 }
                 
-                // Apply assumptions for this year first (will rebuild hourly data and load year-specific settings)
-                await applyAssumptions();
+                // Apply assumptions for this year first (rebuild hourly data and load year-specific settings).
+                // skipModelRun: true prevents the redundant non-headless runModel() — export manages its own runs.
+                await applyAssumptions({ skipModelRun: true });
                 
                 // Use requestAnimationFrame every N years to keep UI responsive (instead of setTimeout every year)
                 if (i % UI_UPDATE_INTERVAL_YEARS === 0) {
@@ -3381,9 +3388,14 @@
                     }
                 }
                 // If no saved data, the default values from applyAssumptions are used
-                
-                // Build config object for headless execution
+
+                // A year with a complete snapshot needs no model re-run — all result values
+                // were captured at save/optimize time and are read directly from savedData below.
+                const hasFullSnapshot = savedYearData?.metrics?.unservedEnergy !== undefined;
+
+                // Always build conf from current DOM — needed if we do have to run the model for an unsaved year.
                 const conf = {
+                    iso: document.getElementById('isoSelector')?.value || '',
                     gasCost: parseFloat(getInputVal('gas-fuel-cost', 3.5)),
                     bidMargin: parseFloat(getInputVal('bid-margin', 25)),
                     storageDur: parseFloat(getInputVal('storage-duration', 2)),
@@ -3405,22 +3417,99 @@
                     energyPriceCap: parseFloat(getInputVal('energy-price-cap', 5000)) || 5000,
                     elccPeakHours: parseInt(getInputVal('elcc-peak-hours', 100)) || 100
                 };
-                
-                // Build capacities object for headless execution
-                const installedCapacities = {};
-                generationTypes.forEach(tech => {
-                    const slider = document.getElementById(`${tech.id}-slider`);
-                    if (slider) {
-                        installedCapacities[tech.id] = parseInt(slider.value) || 0;
+
+                let modelResults = null;
+                let installedCapacities = {};
+                if (!hasFullSnapshot) {
+                    // No complete stored data — run model to compute results and hourly time series
+                    generationTypes.forEach(tech => {
+                        const slider = document.getElementById(`${tech.id}-slider`);
+                        if (slider) {
+                            installedCapacities[tech.id] = parseInt(slider.value) || 0;
+                        } else if (etrCapacities[tech.id] !== undefined) {
+                            installedCapacities[tech.id] = etrCapacities[tech.id];
+                        }
+                    });
+                    modelResults = await runModel(true, conf, installedCapacities);
+                }
+                // hasFullSnapshot → modelResults stays null; DOM fallbacks in buildYearRows are
+                // immediately overwritten by the stored-data patch block below.
+
+                // Build tech rows for this year (long format: one row per technology)
+                const yearRows = buildYearRows(iso, year, modelResults);
+
+                // ── Patch market-wide fields from stored snapshot (ensures export matches UI) ─
+                if (savedYearData?.metrics?.unservedEnergy !== undefined) {
+                    const m = savedYearData.metrics;
+                    const mktPatch = {
+                        'Unserved Energy (MWh)':               Math.round(m.unservedEnergy).toString(),
+                        'Peak Unserved Energy (MW)':           Math.round(m.peakUnservedEnergy).toString(),
+                        'Capacity Market Reserve Margin (%)':  m.capacityMarketRM.toFixed(1),
+                        'Peak Reserve Margin (%)':             m.peakReserveMargin.toFixed(1),
+                        'Renewable Share (%)':                 (m.renewableShare * 100).toFixed(1),
+                        'Clean Energy Share (%)':              (m.cleanEnergyShare * 100).toFixed(1),
+                        'Renewable Curtailment (%)':           (m.renewableCurtailment * 100).toFixed(1),
+                        'REC Price ($/MWh)':                   m.recPrice.toFixed(2),
+                        'Capacity Price ($/MW-d)':             m.capacityPrice.toFixed(2),
+                        'Total Annual Cost ($B)':              (m.totalCost / 1e9).toFixed(2),
+                        'Average Energy Price ($/MWh)':        m.avgEnergyPrice.toFixed(2),
+                    };
+                    if (m.peakLoad !== undefined) {
+                        Object.assign(mktPatch, {
+                            'Peak Load (MW)':              m.peakLoad.toFixed(2),
+                            'Average Load (MW)':           m.avgLoad.toFixed(2),
+                            'Total Annual Load (MWh)':     m.totalLoad.toFixed(2),
+                            'Peak Net Load (MW)':          m.peakNetLoad.toFixed(2),
+                            'Average Net Load (MW)':       m.avgNetLoad.toFixed(2),
+                            'Total Annual Net Load (MWh)': m.totalNetLoad.toFixed(2),
+                        });
                     }
-                });
-                
-                // Run the model in headless mode (skips chart rendering)
-                const modelResults = await runModel(true, conf, installedCapacities);
-                
-                // Collect results for this year
-                const row = buildRow(iso, year, modelResults);
-                allRows.push(row);
+                    if (m.annualGasFuelMMBtu !== undefined) {
+                        const carbonCostForRow = parseFloat(getInputVal('carbon-cost', 0));
+                        const gasCO2  = m.annualGasFuelMMBtu  * CARBON_EMISSIONS_GAS;
+                        const coalCO2 = m.annualCoalFuelMMBtu * CARBON_EMISSIONS_COAL;
+                        const oilCO2  = m.annualOilFuelMMBtu  * CARBON_EMISSIONS_OIL;
+                        const totalCO2 = gasCO2 + coalCO2 + oilCO2;
+                        Object.assign(mktPatch, {
+                            'Annual Gas Fuel (MMBtu)':   m.annualGasFuelMMBtu.toFixed(0),
+                            'Annual Coal Fuel (MMBtu)':  m.annualCoalFuelMMBtu.toFixed(0),
+                            'Annual Oil Fuel (MMBtu)':   m.annualOilFuelMMBtu.toFixed(0),
+                            'Annual Total Fuel (MMBtu)': (m.annualGasFuelMMBtu + m.annualCoalFuelMMBtu + m.annualOilFuelMMBtu).toFixed(0),
+                            'Annual Gas CO2 (Tons)':     gasCO2.toFixed(0),
+                            'Annual Coal CO2 (Tons)':    coalCO2.toFixed(0),
+                            'Annual Oil CO2 (Tons)':     oilCO2.toFixed(0),
+                            'Annual Total CO2 (Tons)':   totalCO2.toFixed(0),
+                            'Annual Carbon Cost ($)':    (totalCO2 * carbonCostForRow).toFixed(0),
+                        });
+                    }
+                    // Apply patch to ALL tech rows for this year
+                    yearRows.forEach(r => Object.assign(r, mktPatch));
+                }
+
+                // ── Patch per-tech financials from stored snapshot ─────────────────────────────
+                if (savedYearData?.techFinancials || savedYearData?.newBuilds || savedYearData?.elcc || savedYearData?.irr) {
+                    generationTypes.forEach(tech => {
+                        if (tech.id === 'coal') return;
+                        const techName = tech.id === 'imports' ? 'Tx Builds' : tech.name;
+                        const techRow = yearRows.find(r => r.Technology === techName);
+                        if (!techRow) return;
+                        const finData = savedYearData.techFinancials?.[tech.id];
+                        if (finData) {
+                            techRow['CF (%)']          = finData.cf.toFixed(1);
+                            techRow['Cap Rev ($/MW-d)'] = finData.capRevPerMWDay.toFixed(2);
+                            techRow['REC Rev ($/MWh)'] = finData.recRevPerMWh.toFixed(2);
+                            if (tech.id !== 'imports') techRow['Energy ($/MWh)'] = finData.capturedPrice.toFixed(2);
+                        }
+                        const storedElcc = savedYearData.elcc?.[tech.id];
+                        if (storedElcc !== undefined) techRow['ELCC (%)'] = (storedElcc * 100).toFixed(1);
+                        const storedIrr = savedYearData.irr?.[tech.id];
+                        if (storedIrr !== undefined) techRow['IRR (%)'] = !isNaN(storedIrr) ? storedIrr.toFixed(1) : '0.0';
+                        const storedBuild = savedYearData.newBuilds?.[tech.id];
+                        if (storedBuild !== undefined) techRow['New Build (MW)'] = storedBuild;
+                    });
+                }
+
+                allRows.push(...yearRows);
                 
                 // Collect hourly time series data for this year
                 if (modelResults && modelResults.hourlyGeneration && modelResults.hourlyPrices && 
@@ -3652,9 +3741,14 @@
                 }, FILE_DOWNLOAD_DELAY_MS);
             }
             
-            // Restore button state
-            exportBtn.disabled = false;
-            exportBtn.textContent = originalText;
+            } catch (exportErr) {
+                console.error('Export failed:', exportErr);
+                showNotification(`Export failed: ${exportErr.message || String(exportErr)}`, true);
+            } finally {
+                // Always restore the button regardless of success or failure
+                exportBtn.disabled = false;
+                exportBtn.textContent = originalText;
+            }
         }
 
         // --- Init Functions ---
@@ -4630,16 +4724,21 @@
                     // Update annual capacity cap - for retire-only technologies, keep at 0
                     // For technologies with scheduled builds, ensure annual cap is at least the scheduled build amount
                     const annCapInput = document.getElementById(`ann-cap-${id}`);
-                    if (annCapInput) { 
+                    if (annCapInput) {
                         const techDef = generationTypes.find(t => t.id === id);
                         if (techDef && techDef.retireOnly) {
                             annCapInput.value = 0;
                         } else {
                             // Calculate the standard annual cap based on existing capacity (excluding scheduled builds)
                             const baseCapacity = mw - scheduledBuildMw;
-                            annCapInput.value = calculateEffectiveAnnualCap(baseCapacity, id, scheduledBuildMw); 
+                            annCapInput.value = calculateEffectiveAnnualCap(baseCapacity, id, scheduledBuildMw);
                         }
                     }
+                } else {
+                    // Techs with no slider element (coal, oil, other) — still track in etrCapacities
+                    // so reserve margin and supply curve calculations include their firm capacity
+                    const scheduledBuildMw = scheduledBuildSums[id] || 0;
+                    etrCapacities[id] = mw - scheduledBuildMw;
                 }
             }
 
@@ -4666,6 +4765,9 @@
             } else {
                 showNotification(`System Updated from DB for ${iso} ${year}`);
             }
+
+            // Snapshot baseline capacities from CSV before the optimizer can modify etrCapacities
+            csvBaselineCapacities = Object.assign({}, etrCapacities);
         }
 
         function rebuildHourlyData() {
@@ -4779,7 +4881,7 @@
             checkEnableButtons();
         }
 
-        async function applyAssumptions() {
+        async function applyAssumptions(options = {}) {
             // 1. Trigger rebuild of hourly data first
             rebuildHourlyData();
 
@@ -5046,6 +5148,19 @@
             const elccPeakHoursRaw = m['Number of Peak Load Hours For ELCC Calc'];
             setVal('elcc-peak-hours', (elccPeakHoursRaw !== undefined && elccPeakHoursRaw !== null && elccPeakHoursRaw !== '') ? parseFloat(elccPeakHoursRaw) : 100);
 
+            // Load Scale Factor: scales every hourly Load_MW value by a multiplier.
+            // Use this to apply load growth when the load CSV represents a base year shape
+            // (e.g., factor = 1.15 for 2030 means all hours scaled up 15% vs the file).
+            // rebuildHourlyData() already ran above with raw file values — apply scaling here.
+            const loadScaleRaw = m['Load Scale Factor'];
+            const loadScaleFactor = (loadScaleRaw !== undefined && loadScaleRaw !== null && loadScaleRaw !== '')
+                ? parseFloat(loadScaleRaw) : 1.0;
+            if (loadScaleFactor !== 1.0 && !isNaN(loadScaleFactor) && hourlyData.length > 0) {
+                for (let i = 0; i < hourlyData.length; i++) {
+                    hourlyData[i].Load_MW *= loadScaleFactor;
+                }
+            }
+
             // 2. Update Technology Specifics
             // Map CSV Tech Name to App ID
             const techMap = {
@@ -5148,15 +5263,17 @@
                 }
             });
 
-            if(hourlyData.length > 0 && dispatchAssets.length > 0) {
+            if(!options.skipModelRun && hourlyData.length > 0 && dispatchAssets.length > 0) {
                 await enableControlsAndRun();
             }
-            updateSaveButtonState();
-            updateMultiYearCapacityChart();
-            updateMultiYearMetricsChart();
-            updateMultiYearElccChart();
-            updateMultiYearIrrChart();
-            showNotification(`Applied: ${iso} ${year}`);
+            if (!options.skipModelRun) {
+                updateSaveButtonState();
+                updateMultiYearCapacityChart();
+                updateMultiYearMetricsChart();
+                updateMultiYearElccChart();
+                updateMultiYearIrrChart();
+                showNotification(`Applied: ${iso} ${year}`);
+            }
             
             // AUTO-CALIBRATE if ISO changed and we have all required data
             if (isoChanged) {
@@ -5927,8 +6044,9 @@
                 generationTypes.forEach(tech => {
                     const slider = document.getElementById(`${tech.id}-slider`);
                     if (slider) installedCapacities[tech.id] = parseInt(slider.value);
+                    else if (etrCapacities[tech.id] !== undefined) installedCapacities[tech.id] = etrCapacities[tech.id];
                 });
-                
+
                 // Get configuration for running the model
                 const gasEl = document.getElementById('gas-fuel-cost');
                 if (!gasEl) {
@@ -5937,6 +6055,7 @@
                 }
                 
                 const conf = {
+                    iso: document.getElementById('isoSelector')?.value || '',
                     gasCost: parseFloat(gasEl.value),
                     bidMargin: parseFloat(document.getElementById('bid-margin').value),
                     storageDur: parseFloat(document.getElementById('storage-duration').value),
@@ -6334,7 +6453,6 @@
         // Set up event listeners for ELCC input fields to track user overrides
         function setupElccInputListeners() {
             generationTypes.forEach(tech => {
-                if (tech.id === 'coal' || tech.id === 'oil' || tech.id === 'other') return;
                 const elccInput = document.getElementById(`elcc-${tech.id}`);
                 if (elccInput) {
                     // When user manually changes ELCC value, mark it as overridden
@@ -6358,7 +6476,6 @@
         function clearElccOverrides() {
             userElccOverrides = {};
             generationTypes.forEach(tech => {
-                if (tech.id === 'coal' || tech.id === 'oil' || tech.id === 'other') return;
                 const elccInput = document.getElementById(`elcc-${tech.id}`);
                 if (elccInput) {
                     elccInput.dataset.elccOverride = 'false';
@@ -6659,13 +6776,21 @@
             const recPriceText = document.getElementById('rec-price-output')?.textContent || '$0.00';
             const recPrice = parseFloat(recPriceText.replace('$', '')) || 0;
             const capPriceText = document.getElementById('capacity-price-output')?.textContent || '$0.00';
-            const capacityPrice = parseFloat(capPriceText.replace('$', '')) || 0;
+            let capacityPrice = parseFloat(capPriceText.replace('$', '')) || 0; // overridden below from fresh calculateMarketMetrics call
             
             // Calculate average energy price and ELCC from current model run
             let avgEnergyPrice = 0;
             let spread2hr = 0;
             let elccValues = {};
             let irrValues = {};
+            // Additional fields stored for export consistency (avoids model re-run discrepancies)
+            let techFinancials = {};
+            let newBuilds = {};
+            let _peakLoad = 0, _avgLoad = 0, _totalLoad = 0;
+            let _peakNetLoad = 0, _avgNetLoad = 0, _totalNetLoad = 0;
+            let _annualGasFuel = 0, _annualCoalFuel = 0, _annualOilFuel = 0;
+            let _savedUnservedEnergy = 0, _savedPeakUnservedEnergy = 0, _savedTotalCost = 0;
+            let _capMarketSnapshot = null;
             if (hourlyData.length > 0 && dispatchAssets.length > 0) {
                 const txMarginInput = document.getElementById('tx-margin-input');
                 
@@ -6673,6 +6798,7 @@
                 const gasCcgtTech = generationTypes.find(t => t.id === 'new-gas-ccgt');
                 
                 const conf = {
+                    iso: document.getElementById('isoSelector')?.value || '',
                     gasCost: gasPrice,
                     bidMargin: parseFloat(document.getElementById('bid-margin').value),
                     storageDur: parseFloat(document.getElementById('storage-duration').value),
@@ -6729,14 +6855,26 @@
                 const priceMetrics = calculatePriceMetrics(finalPrices);
                 spread2hr = priceMetrics ? priceMetrics.spread2hr : 0;
                 
-                // Calculate market metrics to get ELCC values
-                const marketMetrics = calculateMarketMetrics(coreResults, capacities, conf);
+                // Calculate market metrics to get ELCC values and capacity price
+                // Pass finalPrices (calibrated energy prices) so Net CONE revenue matches runModel path
+                const marketMetrics = calculateMarketMetrics({ ...coreResults, hourlyPrices: finalPrices }, capacities, conf);
                 elccValues = (marketMetrics && marketMetrics.elcc) ? marketMetrics.elcc : {};
+                // Override DOM-read capacityPrice with the fresh calculated value
+                if (marketMetrics && marketMetrics.capacityPrice !== undefined) {
+                    capacityPrice = marketMetrics.capacityPrice;
+                }
+                // Snapshot capacity market chart data so chart is consistent when navigating back
+                if (marketMetrics && marketMetrics.supplySteps) {
+                    _capMarketSnapshot = {
+                        supplySteps: marketMetrics.supplySteps,
+                        demandCurveParams: marketMetrics.demandCurveParams,
+                        capacityPrice: marketMetrics.capacityPrice
+                    };
+                }
                 
                 // Override ELCC values with user overrides (from input fields)
                 // When saving, if user has overridden an ELCC value, use that instead of calculated
                 generationTypes.forEach(tech => {
-                    if (tech.id === 'coal' || tech.id === 'oil' || tech.id === 'other') return;
                     const elccInput = document.getElementById(`elcc-${tech.id}`);
                     if (elccInput && elccInput.dataset.elccOverride === 'true') {
                         // User has overridden - save the input value (converted from % to decimal)
@@ -6751,12 +6889,62 @@
                         irrValues[tech.id] = financials[tech.id].irr;
                     }
                 });
+
+                // --- Snapshot data for export consistency ---
+                // Store scalar metrics so export can use these directly without re-running the model,
+                // preventing baseScalars/calibrator-state divergence from producing different numbers.
+
+                // Per-tech financials (CF, captured price, cap rev, REC rev)
+                generationTypes.forEach(tech => {
+                    if (financials[tech.id]) {
+                        techFinancials[tech.id] = {
+                            cf: financials[tech.id].cf,
+                            capturedPrice: financials[tech.id].capturedPrice,
+                            capRevPerMWDay: financials[tech.id].capRevPerMWDay,
+                            recRevPerMWh: financials[tech.id].recRevPerMWh
+                        };
+                    }
+                });
+
+                // New build MW amounts from DOM (set by runModel/runOptimizer)
+                generationTypes.forEach(tech => {
+                    const el = document.getElementById(`new-build-${tech.id}`);
+                    newBuilds[tech.id] = el ? el.textContent.replace(/,/g, '') : '0';
+                });
+
+                // Pre-aggregate load and net load stats
+                const _numHrs = Math.min(hourlyData.length, coreResults.netLoad ? coreResults.netLoad.length : 0, 8760);
+                for (let i = 0; i < _numHrs; i++) {
+                    const ld = hourlyData[i].Load_MW;
+                    _totalLoad += ld;
+                    if (ld > _peakLoad) _peakLoad = ld;
+                    const nl = coreResults.netLoad[i];
+                    _totalNetLoad += nl;
+                    if (nl > _peakNetLoad) _peakNetLoad = nl;
+                }
+                _avgLoad = _numHrs > 0 ? _totalLoad / _numHrs : 0;
+                _avgNetLoad = _numHrs > 0 ? _totalNetLoad / _numHrs : 0;
+
+                // Pre-aggregate annual fuel by type
+                const _existingGasHR = coreResults.existingGasWeightedHeatRate || HEAT_RATE_EXISTING_GAS;
+                for (let i = 0; i < 8760; i++) {
+                    _annualCoalFuel += (coreResults.hourlyGeneration['Coal'][i] || 0) * HEAT_RATE_COAL;
+                    _annualOilFuel  += (coreResults.hourlyGeneration['Oil'][i]  || 0) * HEAT_RATE_OIL;
+                    _annualGasFuel  += ((coreResults.hourlyGeneration['Other'][i]            || 0) * HEAT_RATE_OTHER)
+                                    + ((coreResults.hourlyGeneration['Existing Gas'][i]      || 0) * _existingGasHR)
+                                    + ((coreResults.hourlyGeneration['New Build Gas CCGT'][i] || 0) * HEAT_RATE_CCGT)
+                                    + ((coreResults.hourlyGeneration['New Build Gas CT'][i]   || 0) * HEAT_RATE_CT);
+                }
+
+                // Scalar model results
+                _savedUnservedEnergy = coreResults.unservedEnergy;
+                _savedPeakUnservedEnergy = coreResults.peakUnservedEnergy;
+                _savedTotalCost = coreResults.totalCost;
             }
             
             // Capture which ELCC values are user overrides (to restore them when loading)
             const elccOverrides = {};
             generationTypes.forEach(tech => {
-                if (tech.id === 'coal' || tech.id === 'oil' || tech.id === 'other') return;
                 const elccInput = document.getElementById(`elcc-${tech.id}`);
                 if (elccInput && elccInput.dataset.elccOverride === 'true') {
                     elccOverrides[tech.id] = true;
@@ -6781,11 +6969,29 @@
                     recPrice: recPrice,
                     capacityPrice: capacityPrice,
                     avgEnergyPrice: avgEnergyPrice,
-                    spread2hr: spread2hr
+                    spread2hr: spread2hr,
+                    // Extended snapshot fields — used by export to avoid model re-run discrepancies
+                    unservedEnergy: _savedUnservedEnergy,
+                    peakUnservedEnergy: _savedPeakUnservedEnergy,
+                    totalCost: _savedTotalCost,
+                    peakLoad: _peakLoad,
+                    avgLoad: _avgLoad,
+                    totalLoad: _totalLoad,
+                    peakNetLoad: _peakNetLoad,
+                    avgNetLoad: _avgNetLoad,
+                    totalNetLoad: _totalNetLoad,
+                    annualGasFuelMMBtu: _annualGasFuel,
+                    annualCoalFuelMMBtu: _annualCoalFuel,
+                    annualOilFuelMMBtu: _annualOilFuel,
+                    baseScalarsSnapshot: typeof baseScalars === 'number' ? baseScalars : null,
+                    stretchFactorSnapshot: ppConfig.stretchFactor
                 },
                 elcc: elccValues,
                 elccOverrides: elccOverrides,  // Track which ELCCs are user overrides
-                irr: irrValues
+                irr: irrValues,
+                techFinancials: techFinancials,  // Per-tech CF, captured price, cap/REC rev
+                newBuilds: newBuilds,            // New build MW amounts at time of save
+                capMarketSnapshot: _capMarketSnapshot  // Capacity market chart snapshot for consistent display
             };
             
             // Persist to localStorage only if NOT skipping
@@ -6853,6 +7059,7 @@
             const set = (id, txt) => { const el = uiCache[id]; if(el) el.textContent = txt; };
             set('unserved-energy-output', Math.round(unservedEnergy).toLocaleString());
             set('peak-unserved-energy-output', Math.round(peakUnservedEnergy).toLocaleString());
+            set('peak-load-output', marketMetrics.peakLoad ? (marketMetrics.peakLoad / 1000).toFixed(1) : '0.0');
             set('capacity-market-rm-output', marketMetrics.planningReserveMargin.toFixed(1));
             set('peak-reserve-margin-output', marketMetrics.peakReserveMargin.toFixed(1));
             set('renewable-share-output', (marketMetrics.renewableShare * 100).toFixed(1));
@@ -6960,6 +7167,7 @@
                 const gasCcgtTech = generationTypes.find(t => t.id === 'new-gas-ccgt');
                 
                 conf = {
+                    iso: document.getElementById('isoSelector')?.value || '',
                     gasCost: parseFloat(gasEl.value),
                     bidMargin: parseFloat(document.getElementById('bid-margin').value),
                     storageDur: parseFloat(document.getElementById('storage-duration').value),
@@ -6987,6 +7195,7 @@
                 generationTypes.forEach(tech => {
                     const slider = document.getElementById(`${tech.id}-slider`);
                     if(slider) installedCapacities[tech.id] = parseInt(slider.value);
+                    else if (etrCapacities[tech.id] !== undefined) installedCapacities[tech.id] = etrCapacities[tech.id];
                 });
             }
             
@@ -7107,8 +7316,21 @@
                 updateDiurnalMixChart(modelResults.hourlyGeneration, modelResults.hourlyPrices, coreResults.hourlyPrices, historicalPrices);
                 updateDispatchCurveChart(modelResults.fullDispatchStack);
 
+                // If this year has a saved capacity market snapshot (from optimizer run), use it for the chart
+                // so the displayed clearing price matches the saved metrics — avoids calibration-state drift.
+                const _snapIso = document.getElementById('isoSelector').value;
+                const _capSnap = savedData[_snapIso]?.[currentYear]?.capMarketSnapshot;
+                if (_capSnap && _capSnap.supplySteps) {
+                    updateCapacityMarketChart({ ...marketMetrics, ..._capSnap });
+                } else {
+                    updateCapacityMarketChart(marketMetrics);
+                }
+
                 const safeSetText = (id, val) => { const el = document.getElementById(id); if(el) el.textContent = val; };
-                safeSetText('capacity-price-output', `$${marketMetrics.capacityPrice.toFixed(2)}`);
+                const _displayCapPrice = (_capSnap && _capSnap.capacityPrice !== undefined)
+                    ? _capSnap.capacityPrice : marketMetrics.capacityPrice;
+                safeSetText('peak-load-output', marketMetrics.peakLoad ? (marketMetrics.peakLoad / 1000).toFixed(1) : '0.0');
+                safeSetText('capacity-price-output', `$${_displayCapPrice.toFixed(2)}`);
                 safeSetText('rec-price-output', `$${marketMetrics.recPrice.toFixed(2)}`);
                 safeSetText('renewable-share-output', (marketMetrics.renewableShare * 100).toFixed(1));
                 safeSetText('clean-energy-share-output', (marketMetrics.cleanEnergyShare * 100).toFixed(1));
@@ -7276,17 +7498,31 @@
             loadWithIndices.sort((a, b) => b.val - a.val);
             const top100Indices = loadWithIndices.slice(0, elccPeakHours).map(item => item.idx);
             const elccValues = {};
+            const thermalIds = new Set(['coal', 'oil', 'other', 'existing-gas', 'new-gas-ccgt', 'new-gas-ct']);
             generationTypes.forEach(tech => {
-                // Check if user has manually overridden the ELCC value for this technology
+                // Priority 1: user manually overrode the ELCC input field
                 if (userElccOverrides[tech.id] !== undefined) {
-                    // Use user override (convert from percentage to decimal)
                     elccValues[tech.id] = userElccOverrides[tech.id] / 100;
-                } else if (csvHardcodedElcc[tech.id] !== undefined) {
-                    // Use hardcoded ELCC from CSV (convert from percentage to decimal)
+                    return;
+                }
+
+                // Priority 2: value supplied in the econ/market assumptions file
+                if (csvHardcodedElcc[tech.id] !== undefined) {
                     elccValues[tech.id] = csvHardcodedElcc[tech.id] / 100;
-                } else if (tech.id === 'storage') {
-                    // Storage ELCC: capacity factor during top N peak load hours
-                    // Average discharge generation during the top elccPeakHours load hours divided by installed capacity
+                    return;
+                }
+
+                // Priority 3: calculate from peak-hour dispatch
+                // Map tech id to the hourlyGeneration key used by the dispatch model
+                const genKeyMap = {
+                    'storage':      'Storage',
+                    'existing-gas': 'Existing Gas',
+                    'new-gas-ccgt': 'New Build Gas CCGT',
+                    'new-gas-ct':   'New Build Gas CT'
+                };
+                const genKey = genKeyMap[tech.id] || tech.name; // Coal, Oil, Other, renewables all match tech.name
+
+                if (tech.id === 'storage') {
                     const installedCap = installedCapacities['storage'] || 0;
                     if (installedCap === 0) {
                         elccValues[tech.id] = 0;
@@ -7295,20 +7531,26 @@
                         top100Indices.forEach(idx => {
                             totalStorageGen += Math.max(0, modelResults.hourlyGeneration['Storage'][idx] || 0);
                         });
-                        const avgGen = totalStorageGen / elccPeakHours;
-                        elccValues[tech.id] = Math.min(1, avgGen / installedCap);
+                        elccValues[tech.id] = Math.min(1, (totalStorageGen / elccPeakHours) / installedCap);
                     }
-                } else if (tech.id === 'coal' || tech.id === 'oil' || tech.id === 'other' || tech.id === 'existing-gas' || tech.id === 'new-gas-ccgt' || tech.id === 'new-gas-ct') {
-                    // Thermal (coal, oil, other, gas types): Default to 100% ELCC
-                    elccValues[tech.id] = 1.0;
                 } else {
-                    // All other technologies (renewables, biomass, nuclear, hydro, geothermal): 
-                    // Calculate based on generation during top peak load hours using tech.name as the key
-                    let totalGenTop100 = 0; 
-                    top100Indices.forEach(idx => { 
-                        totalGenTop100 += modelResults.hourlyGeneration[tech.name][idx]; 
+                    let totalGenTop100 = 0;
+                    top100Indices.forEach(idx => {
+                        totalGenTop100 += modelResults.hourlyGeneration[genKey]?.[idx] || 0;
                     });
-                    const avgGen = totalGenTop100 / elccPeakHours; elccValues[tech.id] = installedCapacities[tech.id] > 0 ? Math.min(1, avgGen / installedCapacities[tech.id]) : 0;
+                    const avgGen = totalGenTop100 / elccPeakHours;
+                    const elccDenomSlider = document.getElementById(`${tech.id}-slider`);
+                    const elccDenomSliderVal = elccDenomSlider ? (parseInt(elccDenomSlider.value) || 0) : 0;
+                    const elccInstalledCap = elccDenomSliderVal || installedCapacities[tech.id] || etrCapacities[tech.id] || 0;
+                    let calculated = elccInstalledCap > 0 ? Math.min(1, avgGen / elccInstalledCap) : 0;
+
+                    // Thermal floor: dispatch-based calculation doesn't capture forced outage rates,
+                    // so a floor of 50% prevents unrealistically low accreditation for coal/oil/gas.
+                    if (thermalIds.has(tech.id)) {
+                        calculated = Math.max(0.50, calculated);
+                    }
+
+                    elccValues[tech.id] = calculated;
                 }
             });
             
@@ -7318,26 +7560,28 @@
             const peakLoad = Math.max(...loadOnly);
             let totalAccreditedCapacity = 0;
             generationTypes.forEach(tech => {
-                const installedCap = installedCapacities[tech.id] || 0;
+                // Source priority for installed capacity:
+                // 1. Current slider value (most up-to-date, set by updateSystemFromProjectDB)
+                // 2. installedCapacities parameter (passed in by runModel / optimizer)
+                // 3. etrCapacities (DB-loaded baseline, fallback when sliders not yet set)
+                // Math.max(0,...) prevents net exporters (negative imports) from reducing accredited capacity.
+                const slider = document.getElementById(`${tech.id}-slider`);
+                const sliderVal = slider ? (parseInt(slider.value) || 0) : 0;
+                let installedCap = Math.max(0, sliderVal || installedCapacities[tech.id] || 0);
+                if (installedCap === 0 && etrCapacities[tech.id] > 0) {
+                    installedCap = etrCapacities[tech.id];
+                }
                 const elcc = elccValues[tech.id] || 0;
                 totalAccreditedCapacity += installedCap * elcc;
             });
-            const marketStyleReserveMargin = peakLoad > 0 ? ((totalAccreditedCapacity / peakLoad) - 1) * 100 : 0;
+            // RM denominator uses auctionLoad (peakLoad net of FRR self-supply) so it is directly
+            // comparable to the cap/floor RM thresholds, which are also applied to auctionLoad.
+            // auctionLoad is computed below; approximate it here using the same FRR pct.
+            const _frrPctForRM = (() => { const FRR = { 'PJM': 0.10 }; return FRR[conf.iso] || 0; })();
+            const _auctionLoadForRM = peakLoad * (1 - _frrPctForRM);
+            const marketStyleReserveMargin = _auctionLoadForRM > 0 ? ((totalAccreditedCapacity / _auctionLoadForRM) - 1) * 100 : 0;
             
-            // Use the market-style reserve margin (based on ELCC) for capacity price calculation
-            // This ensures the capacity price reflects accredited capacity, not physical generation at peak
-            const peakReserveMargin = marketStyleReserveMargin;
-            let capacityPrice = capPriceFloor;
-            // Simple linear interpolation between cap price at low RM threshold and floor price at high RM threshold
-            // Case 1: RM is at or below the cap threshold (low RM) - price is at cap
-            if (peakReserveMargin <= capRmThreshold) capacityPrice = capPriceCap;
-            // Case 2: RM is at or above floor threshold (high RM) - price is at floor
-            else if (peakReserveMargin >= floorRmThreshold) capacityPrice = capPriceFloor;
-            // Case 3: RM is between cap threshold and floor threshold - linear interpolation
-            else {
-                const range = floorRmThreshold - capRmThreshold;
-                capacityPrice = range > 0 ? capPriceCap - ((peakReserveMargin - capRmThreshold) / range) * (capPriceCap - capPriceFloor) : capPriceCap;
-            }
+            // ── Compute REC price first (needed for supply curve offer price calculations) ──
             const totalLoadMWh = loadOnly.reduce((a,b) => a+b, 0);
             const recDemand = totalLoadMWh * rpsTarget;
             let totalRenewableGen = 0;
@@ -7350,6 +7594,202 @@
             if (shortageRatio <= recCapThreshold) recPrice = recAcp;
             else if (shortageRatio >= recFloorThreshold) recPrice = recFloor;
             else recPrice = recAcp - ((shortageRatio - recCapThreshold) / (recFloorThreshold - recCapThreshold)) * (recAcp - recFloor);
+
+            // ── Build supply/demand curves and intersect to clear capacity market ──────────
+            // Supply: existing assets offer at avoidable cost (capex sunk → capex = 0);
+            //         new builds offer at Net CONE (capex annualized at hurdle rate minus
+            //         energy, REC, PTC, and AS revenues already earned in the energy market).
+            // Demand: downward-sloping linear curve using existing cap price / RM threshold inputs,
+            //         expressed in accredited MW (physical MW × ELCC).
+            const existingGasHR = modelResults.existingGasWeightedHeatRate || HEAT_RATE_EXISTING_GAS;
+            const carbonCost    = parseFloat(document.getElementById('carbon-cost')?.value) || 0;
+            const calibratedPrices = modelResults.hourlyPrices; // calibrated energy prices (post-processing applied)
+            const pvAnnuity     = (r, n) => r > 0 ? (1 - Math.pow(1 + r, -n)) / r : n;
+
+            const supplySteps = [];
+            generationTypes.forEach(tech => {
+                // Imports do not offer into the capacity market.
+                // Coal, oil, and other ARE included: they offer existing capacity at avoidable cost
+                // (the retireOnly flag already prevents new-build / potential steps from being added).
+                if (tech.id === 'imports') return;
+                const totalMW = installedCapacities[tech.id] || 0;
+                if (totalMW <= 0) return;
+                const elcc = elccValues[tech.id] || 0;
+                if (elcc <= 0) return;
+
+                const opexPerMWYr  = (parseFloat(document.getElementById(`opex-${tech.id}`)?.value) || 0) * 12;
+                const asRevPerMWYr = (parseFloat(document.getElementById(`as-rev-${tech.id}`)?.value) || 0) * 12;
+
+                // Map tech id to hourlyGeneration key
+                let genKey;
+                if      (tech.id === 'storage')      genKey = 'Storage';
+                else if (tech.id === 'existing-gas') genKey = 'Existing Gas';
+                else if (tech.id === 'new-gas-ccgt') genKey = 'New Build Gas CCGT';
+                else if (tech.id === 'new-gas-ct')   genKey = 'New Build Gas CT';
+                else                                  genKey = tech.name;
+
+                const genArray = modelResults.hourlyGeneration[genKey];
+
+                // Energy revenue per installed MW (net of fuel & carbon costs for thermal)
+                // Uses calibrated energy prices — capacity market revenue is separate and not included
+                let energyRevPerMWYr = 0;
+                let totalGenMWh = 0;
+                if (genArray && calibratedPrices) {
+                    let totalRev = 0;
+                    for (let h = 0; h < 8760; h++) {
+                        const gen = genArray[h];
+                        if (gen > 0) { totalRev += gen * calibratedPrices[h]; totalGenMWh += gen; }
+                        else if (tech.id === 'storage' && gen < 0) { totalRev += gen * calibratedPrices[h]; } // charge cost
+                    }
+                    if (tech.id === 'existing-gas') {
+                        totalRev -= totalGenMWh * existingGasHR  * conf.gasCost;
+                        totalRev -= totalGenMWh * existingGasHR  * CARBON_EMISSIONS_GAS  * carbonCost;
+                    } else if (tech.id === 'new-gas-ccgt') {
+                        totalRev -= totalGenMWh * HEAT_RATE_CCGT * conf.gasCost;
+                        totalRev -= totalGenMWh * HEAT_RATE_CCGT * CARBON_EMISSIONS_GAS  * carbonCost;
+                    } else if (tech.id === 'new-gas-ct') {
+                        totalRev -= totalGenMWh * HEAT_RATE_CT   * conf.gasCost;
+                        totalRev -= totalGenMWh * HEAT_RATE_CT   * CARBON_EMISSIONS_GAS  * carbonCost;
+                    } else if (tech.id === 'coal') {
+                        const coalPrice = parseFloat(document.getElementById('coal-fuel-cost')?.value) || 2.0;
+                        totalRev -= totalGenMWh * HEAT_RATE_COAL * coalPrice;
+                        totalRev -= totalGenMWh * HEAT_RATE_COAL * CARBON_EMISSIONS_COAL * carbonCost;
+                    } else if (tech.id === 'oil') {
+                        const oilPrice = parseFloat(document.getElementById('oil-fuel-cost')?.value) || 15.0;
+                        totalRev -= totalGenMWh * HEAT_RATE_OIL  * oilPrice;
+                        totalRev -= totalGenMWh * HEAT_RATE_OIL  * CARBON_EMISSIONS_OIL  * carbonCost;
+                    } else if (tech.id === 'other') {
+                        // "Other" thermal — treated as gas-equivalent at base gas price
+                        totalRev -= totalGenMWh * HEAT_RATE_OTHER * conf.gasCost;
+                        totalRev -= totalGenMWh * HEAT_RATE_OTHER * CARBON_EMISSIONS_GAS  * carbonCost;
+                    }
+                    energyRevPerMWYr = totalMW > 0 ? totalRev / totalMW : 0;
+                }
+                const recRevPerMWYr = tech.type === 'renewable' && totalMW > 0
+                    ? (totalGenMWh / totalMW) * recPrice : 0;
+
+                // Avoidable-cost offer price: capex is sunk for all installed/committed capacity
+                // Offer = max(0, (FOM − energy rev − REC rev − AS rev) / (365 × ELCC))
+                const avoidableCostOffer = Math.max(0,
+                    (opexPerMWYr - energyRevPerMWYr - recRevPerMWYr - asRevPerMWYr) / (365 * elcc)
+                );
+
+                // Existing capacity from CSV baseline: avoidable-cost offer (segment: 'existing' → solid line)
+                const existingMW = Math.min(totalMW, csvBaselineCapacities[tech.id] || etrCapacities[tech.id] || 0);
+                if (existingMW > 0) {
+                    supplySteps.push({ techId: tech.id, techName: tech.name, color: tech.color, segment: 'existing', accreditedMW: existingMW * elcc, offerPrice: avoidableCostOffer });
+                }
+
+                // Committed new builds (optimizer-built above CSV baseline): bid Net CONE
+                // These are new assets the optimizer decided to build; they need to recover capex
+                // existing-gas is retire-only — no new builds
+                const newBuildMW = Math.max(0, totalMW - existingMW);
+                const canBuildNew = tech.id !== 'existing-gas' && !(generationTypes.find(t => t.id === tech.id)?.retireOnly);
+                if (canBuildNew) {
+                    // Net CONE used only for potential (uncommitted) new builds
+                    const hurdle      = (parseFloat(document.getElementById(`hurdle-${tech.id}`)?.value) || 7) / 100;
+                    const life        = parseInt(document.getElementById(`life-${tech.id}`)?.value) || 25;
+                    const capex       = parseFloat(document.getElementById(`capex-${tech.id}`)?.value) || 0;
+                    const taxCredit   = currentTaxCredits[tech.id] || DEFAULT_TAX_CREDIT;
+                    const itcFraction = taxCredit.type === 'ITC' ? (taxCredit.itcPercent / 100) : 0;
+                    const ptcPerMWh   = taxCredit.type === 'PTC' ? (taxCredit.ptcPerMWh || 0) : 0;
+                    const CRF     = hurdle > 0
+                        ? hurdle * Math.pow(1 + hurdle, life) / (Math.pow(1 + hurdle, life) - 1)
+                        : 1 / life;
+                    const annCapex = capex * 1000 * (1 - itcFraction) * CRF;
+                    let ptcAnnualizedPerMWYr = 0;
+                    if (ptcPerMWh > 0 && totalMW > 0) {
+                        const ptcDur = Math.min(tech.id === 'nuclear' ? life : 10, life);
+                        ptcAnnualizedPerMWYr = ptcPerMWh * (totalGenMWh / totalMW)
+                            * (pvAnnuity(hurdle, ptcDur) / pvAnnuity(hurdle, life));
+                    }
+                    const netCONE = Math.max(0,
+                        (annCapex + opexPerMWYr - energyRevPerMWYr - recRevPerMWYr - ptcAnnualizedPerMWYr - asRevPerMWYr)
+                        / (365 * elcc)
+                    );
+
+                    // Committed new builds (optimizer-built above CSV baseline): bid Net CONE
+                    if (newBuildMW > 0) {
+                        supplySteps.push({ techId: tech.id, techName: tech.name, color: tech.color, segment: 'new', accreditedMW: newBuildMW * elcc, offerPrice: netCONE });
+                    }
+                    // Potential new builds (could be built next year): bid Net CONE
+                    const potentialNextMW = calculateAnnualCap(totalMW, tech.id);
+                    if (potentialNextMW > 0) {
+                        supplySteps.push({ techId: tech.id, techName: tech.name, color: tech.color, segment: 'potential', accreditedMW: potentialNextMW * elcc, offerPrice: netCONE });
+                    }
+                }
+            });
+
+            // Sort supply steps by offer price ascending (cheapest units offered first)
+            supplySteps.sort((a, b) => a.offerPrice - b.offerPrice);
+
+            // Fixed Resource Requirement (FRR) adjustment:
+            // In markets with an FRR mechanism, certain LSEs self-supply their capacity obligation
+            // outside the centralized auction. The demand curve is built on the residual "auction load"
+            // (total peak load minus FRR self-supply load), not total peak load.
+            //   PJM: FRR (~8% of peak load, historically 7–8% post-2025 after Dominion exited FRR)
+            //   MISO: no FRR haircut — FRAP self-supply modelled implicitly via full supply curve
+            // ISO-NE, NYISO, CAISO, SPP, ERCOT: no FRR or no centralized capacity auction.
+            const FRR_MARKETS = { 'PJM': 0.10 };
+            const frrPct = FRR_MARKETS[conf.iso] || 0;
+            const auctionLoad = peakLoad * (1 - frrPct);
+
+            // Demand curve: downward-sloping VRR curve (used by PJM, and now MISO post-2024 reform).
+            //   At capPriceCap   → demands auctionLoad × (1 + capRmThreshold%)   accredited MW
+            //   At capPriceFloor → demands auctionLoad × (1 + floorRmThreshold%) accredited MW
+            const mwAtCapPrice   = auctionLoad * (1 + capRmThreshold   / 100);
+            const mwAtFloorPrice = auctionLoad * (1 + floorRmThreshold / 100);
+            const demandQtyAtPrice = price => {
+                if (price >= capPriceCap)   return mwAtCapPrice;
+                if (price <= capPriceFloor) return mwAtFloorPrice;
+                return mwAtCapPrice + (capPriceCap - price) / (capPriceCap - capPriceFloor) * (mwAtFloorPrice - mwAtCapPrice);
+            };
+
+            // Clearing: find the geometric intersection of the step-function supply curve with
+            // the VRR demand curve.
+            //
+            // Only existing + committed new builds participate in clearing.
+            // Potential builds are shown on the chart for context but are uncommitted —
+            // they do not set the clearing price for the current year.
+            //
+            // At each supply step the curve has two segments:
+            //   HORIZONTAL — supply is flat at cumMW for prices between this step's offer
+            //                and the next step's offer. If the VRR inverse price at cumMW
+            //                falls in that price band, the demand curve crosses the horizontal.
+            //   VERTICAL   — supply jumps when a new step bids in at its offer price. If the
+            //                VRR demand quantity at that price falls between prevCumMW and cumMW,
+            //                the demand curve crosses the vertical step.
+            // Walk the sorted supply steps against the VRR demand curve. A unit clears only if
+            // its offer price ≤ the VRR demand price at the cumulative MW quantity reached after
+            // including it.
+            const vrrAtMW = mw => {
+                if (mw <= mwAtCapPrice)   return capPriceCap;
+                if (mw >= mwAtFloorPrice) return capPriceFloor;
+                return capPriceCap - (mw - mwAtCapPrice) / (mwAtFloorPrice - mwAtCapPrice) * (capPriceCap - capPriceFloor);
+            };
+
+            let clearingMW = 0;
+            let capacityPrice = capPriceCap; // no supply → demand unmet → price at cap
+
+            for (const step of supplySteps) { // already sorted ascending by offerPrice
+                if (step.offerPrice > vrrAtMW(clearingMW)) break; // bid above current demand price → won't clear
+
+                const nextMW  = clearingMW + step.accreditedMW;
+                const vrrNext = vrrAtMW(nextMW);
+
+                if (vrrNext >= step.offerPrice) {
+                    // VRR still at or above this step's bid after full inclusion → whole step clears
+                    clearingMW    = nextMW;
+                    capacityPrice = Math.max(capPriceFloor, vrrNext);
+                } else {
+                    // VRR drops below this step's bid within the step → find exact intersection
+                    // Solve VRR(x) = step.offerPrice → x = demandQtyAtPrice(step.offerPrice)
+                    clearingMW    = demandQtyAtPrice(step.offerPrice);
+                    capacityPrice = step.offerPrice;
+                    break;
+                }
+            }
+            capacityPrice = Math.min(capPriceCap, Math.max(capPriceFloor, capacityPrice));
             
             // Calculate Peak Reserve Margin - unused dispatchable capacity at peak load hour
             // Find the hour with peak load
@@ -7435,7 +7875,7 @@
             });
             const renewableCurtailment = totalWindAndSolarGen > 0 ? totalCurtailedGen / totalWindAndSolarGen : 0;
             
-            return { elcc: elccValues, capacityPrice: Math.min(capPriceCap, Math.max(capPriceFloor, capacityPrice)), recPrice: Math.max(0, recPrice), renewableShare: totalLoadMWh > 0 ? totalRenewableGen / totalLoadMWh : 0, cleanEnergyShare: totalLoadMWh > 0 ? totalCleanEnergyGen / totalLoadMWh : 0, planningReserveMargin: marketStyleReserveMargin, peakReserveMargin: actualPeakReserveMargin, renewableCurtailment: renewableCurtailment };
+            return { elcc: elccValues, capacityPrice: Math.min(capPriceCap, Math.max(capPriceFloor, capacityPrice)), recPrice: Math.max(0, recPrice), renewableShare: totalLoadMWh > 0 ? totalRenewableGen / totalLoadMWh : 0, cleanEnergyShare: totalLoadMWh > 0 ? totalCleanEnergyGen / totalLoadMWh : 0, planningReserveMargin: marketStyleReserveMargin, peakReserveMargin: actualPeakReserveMargin, renewableCurtailment: renewableCurtailment, peakLoad, supplySteps, demandCurveParams: { mwAtCapPrice, mwAtFloorPrice, capPriceCap, capPriceFloor } };
         }
         async function runCoreModel(installedCapacities, conf, hourlyGasPrices) {
             const hourlyGeneration = {};
@@ -9011,6 +9451,157 @@
             });
         }
         
+        function updateCapacityMarketChart(marketMetrics) {
+            const ctx = document.getElementById('capMarketChart');
+            if (!ctx) return;
+            if (capMarketChart) capMarketChart.destroy();
+
+            const { supplySteps, demandCurveParams, capacityPrice } = marketMetrics;
+            if (!supplySteps || supplySteps.length === 0) return;
+
+            const { mwAtCapPrice, mwAtFloorPrice, capPriceCap, capPriceFloor } = demandCurveParams;
+
+            // ── Supply curve: one dataset per (tech, segment) pair ────────────────
+            // Each dataset covers only its MW range; stepped:before draws horizontal bars.
+            // Existing capacity → solid line; new builds → dashed line (same color).
+            const supplyDatasets = {};
+            let cumMW = 0;
+
+            for (const step of supplySteps) {
+                const key = `${step.techId}-${step.segment}`;
+                if (!supplyDatasets[key]) {
+                    const isExisting  = step.segment === 'existing';
+                    const isPotential = step.segment === 'potential';
+                    const borderColor = isPotential ? step.color + '66' : step.color;
+                    supplyDatasets[key] = {
+                        label: isExisting ? step.techName : isPotential ? `${step.techName} (Potential)` : `${step.techName} (New)`,
+                        data: [],
+                        borderColor,
+                        backgroundColor: borderColor,
+                        borderWidth: isExisting ? 3 : 2,
+                        borderDash: isExisting ? [] : isPotential ? [3, 3] : [5, 3],
+                        pointRadius: 0,
+                        stepped: 'before',
+                        spanGaps: false,
+                        fill: false,
+                        tension: 0,
+                        order: 2,
+                        _totalAccreditedMW: 0
+                    };
+                }
+                supplyDatasets[key]._totalAccreditedMW += step.accreditedMW;
+                const start = cumMW;
+                cumMW += step.accreditedMW;
+                // Two points per step: start and end of horizontal segment
+                supplyDatasets[key].data.push({ x: start, y: step.offerPrice });
+                supplyDatasets[key].data.push({ x: cumMW,  y: step.offerPrice });
+            }
+
+            const totalSupplyMW = cumMW;
+
+            // ── Demand curve: smooth downward-sloping line ────────────────────────
+            const xMax = Math.max(totalSupplyMW * 1.05, mwAtFloorPrice * 1.05);
+            const demandPoints = [];
+            const N = 200;
+            for (let i = 0; i <= N; i++) {
+                const mw = (xMax / N) * i;
+                let price;
+                if (mw <= mwAtCapPrice)   price = capPriceCap;
+                else if (mw >= mwAtFloorPrice) price = capPriceFloor;
+                else price = capPriceCap - (mw - mwAtCapPrice) / (mwAtFloorPrice - mwAtCapPrice) * (capPriceCap - capPriceFloor);
+                demandPoints.push({ x: mw, y: price });
+            }
+
+            const demandDataset = {
+                label: 'Demand Curve',
+                data: demandPoints,
+                borderColor: '#ffffff',
+                backgroundColor: 'transparent',
+                borderWidth: 2,
+                pointRadius: 0,
+                stepped: false,
+                fill: false,
+                tension: 0,
+                order: 1
+            };
+
+            // ── Clearing price: green dashed horizontal line to intersection ──────
+            const clampedPrice = Math.min(capPriceCap, Math.max(capPriceFloor, capacityPrice));
+            let clearingMW;
+            if (clampedPrice >= capPriceCap)        clearingMW = mwAtCapPrice;
+            else if (clampedPrice <= capPriceFloor) clearingMW = mwAtFloorPrice;
+            else clearingMW = mwAtCapPrice + (capPriceCap - clampedPrice) / (capPriceCap - capPriceFloor) * (mwAtFloorPrice - mwAtCapPrice);
+
+            const clearingDataset = {
+                label: `Clearing: $${clampedPrice.toFixed(0)}/MW-d`,
+                data: [{ x: 0, y: clampedPrice }, { x: clearingMW, y: clampedPrice }],
+                borderColor: '#22c55e',
+                backgroundColor: 'transparent',
+                borderWidth: 1.5,
+                borderDash: [6, 3],
+                pointRadius: 0,
+                stepped: false,
+                fill: false,
+                order: 0
+            };
+
+            const datasets = [...Object.values(supplyDatasets), demandDataset, clearingDataset];
+
+            capMarketChart = new Chart(ctx.getContext('2d'), {
+                type: 'line',
+                data: { datasets },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    interaction: { mode: 'index', intersect: false },
+                    plugins: {
+                        legend: {
+                            position: 'top',
+                            labels: { color: '#9ca3af', boxWidth: 10, font: { size: 9 } }
+                        },
+                        title: {
+                            display: true,
+                            text: 'Capacity Market — Supply & Demand Curves',
+                            color: '#e0e0e0',
+                            font: { weight: 'bold', size: 11 }
+                        },
+                        tooltip: {
+                            callbacks: {
+                                label: item => {
+                                    if (item.parsed.y === null) return null;
+                                    const mw = item.dataset._totalAccreditedMW;
+                                    const mwStr = mw != null
+                                        ? `  |  ${mw >= 1000 ? (mw / 1000).toFixed(1) + ' GW' : mw.toFixed(0) + ' MW'}`
+                                        : '';
+                                    return `${item.dataset.label}: $${item.parsed.y.toFixed(0)}/MW-d${mwStr}`;
+                                },
+                                title: items => `@ ${(items[0].parsed.x / 1000).toFixed(1)} GW cumulative`
+                            }
+                        }
+                    },
+                    scales: {
+                        x: {
+                            type: 'linear',
+                            title: { display: true, text: 'Accredited Capacity (MW)', color: '#9ca3af', font: { size: 10 } },
+                            ticks: { color: '#9ca3af', font: { size: 9 },
+                                callback: v => v >= 1000 ? `${(v/1000).toFixed(0)}GW` : `${v}MW` },
+                            grid: { color: 'rgba(255,255,255,0.05)' },
+                            min: 0,
+                            max: xMax
+                        },
+                        y: {
+                            title: { display: true, text: '$/MW-day', color: '#9ca3af', font: { size: 10 } },
+                            ticks: { color: '#9ca3af', font: { size: 9 },
+                                callback: v => `$${v.toFixed(0)}` },
+                            grid: { color: 'rgba(255,255,255,0.05)' },
+                            min: 0,
+                            max: capPriceCap * 1.2
+                        }
+                    }
+                }
+            });
+        }
+
         // Helper function to update all multi-year charts
         // Used after batch processing completes to refresh all chart visualizations in a single call.
         // This prevents double rendering by consolidating chart updates that would otherwise occur
