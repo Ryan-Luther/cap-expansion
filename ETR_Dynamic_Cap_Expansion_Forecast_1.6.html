@@ -1812,11 +1812,13 @@
             updateCalibratorStatusUI();
         }
 
-        // Helper function to normalize ISO names (treat ISONE and ISO-NE as the same)
+        // Helper function to normalize ISO names (treat ISONE and ISO-NE as the same,
+        // and map SERC→SE and WECC→WEST to align Assumptions file naming with Load/CF/HistPrices files)
         function normalizeISOName(isoName) {
             if (!isoName) return isoName;
             const normalized = isoName.toUpperCase().replace(/-/g, '');
-            return normalized;
+            const aliases = { 'SERC': 'SE', 'WECC': 'WEST' };
+            return aliases[normalized] || normalized;
         }
 
         // Helper function to check if two ISO names are equivalent
@@ -2798,18 +2800,18 @@
                         updateMultiYearCharts();
                     } else if (type === 'finished') {
                         console.log('✓ All years completed', summary);
-                        
+
                         // Save all data to LocalStorage once at the end
                         persistSavedData();
-                        
+
                         isWorkerProcessing = false;
-                        
+
                         const optimizeAllBtn = document.getElementById('optimizeAllYearsButton');
                         if (optimizeAllBtn) {
                             optimizeAllBtn.disabled = false;
                             optimizeAllBtn.textContent = 'Run All Years';
                         }
-                        
+
                         if (summary) {
                             if (summary.error) {
                                 showNotification(`Optimization stopped due to error: ${summary.error}`, true);
@@ -2817,7 +2819,23 @@
                                 showNotification(`Batch optimization complete. Saved ${summary.savedAsIsCount} year(s) as-is, optimized ${summary.optimizedCount} year(s) for ${summary.iso}`);
                             }
                         }
-                        
+
+                        // Diagnostic: log savedData contents for current ISO
+                        const _diagIso = document.getElementById('isoSelector')?.value;
+                        const _diagData = savedData[_diagIso];
+                        if (_diagData) {
+                            const _diagYears = Object.keys(_diagData).sort();
+                            console.log(`[Diag] savedData["${_diagIso}"] has ${_diagYears.length} year(s): ${_diagYears.join(', ')}`);
+                            _diagYears.forEach(yr => {
+                                const caps = _diagData[yr]?.capacities;
+                                if (caps) {
+                                    console.log(`[Diag]   ${yr}: solar=${caps.solar}, storage=${caps.storage}, 'onshore-wind'=${caps['onshore-wind']}`);
+                                }
+                            });
+                        } else {
+                            console.warn(`[Diag] savedData["${_diagIso}"] is EMPTY or undefined after optimization!`);
+                        }
+
                         updateMultiYearCharts();
                     }
                 };
@@ -3034,11 +3052,51 @@
             if (marketAssumptions && marketAssumptions[iso]) {
                 Object.keys(marketAssumptions[iso]).forEach(yr => yearsForIso.push(yr));
             }
-            
+
             if (yearsForIso.length === 0) {
-                // If no years from marketAssumptions, just use current year
-                const currentYear = document.getElementById('yearSelector').value || new Date().getFullYear();
-                yearsForIso.push(currentYear);
+                // Fall back to all years in the year selector (populated from load data or market assumptions)
+                const yearSel = document.getElementById('yearSelector');
+                if (yearSel && yearSel.options.length > 1) {
+                    Array.from(yearSel.options).forEach(opt => {
+                        if (opt.value && opt.value.trim()) yearsForIso.push(opt.value);
+                    });
+                }
+                // If the year selector has ≤1 year (e.g., load data only covers one year and no market
+                // assumptions were loaded for this ISO), build a forecast range from the project database.
+                // This ensures CAISO and other ISOs without market assumptions still run multi-year forecasts.
+                if (yearsForIso.length <= 1 && projectDatabase && projectDatabase.length > 0) {
+                    const projYearSet = new Set();
+                    projectDatabase.forEach(proj => {
+                        const projIso = proj.ISOTerritory;
+                        const isCAISOSubzone = ['SP15', 'NP15', 'ZP26'].includes(projIso);
+                        const isoMatch = isoNamesMatch(projIso, iso) || (isoNamesMatch(iso, 'CAISO') && isCAISOSubzone);
+                        if (!isoMatch) return;
+                        if (proj.FirstPowerDate) {
+                            const yr = new Date(proj.FirstPowerDate).getFullYear();
+                            if (!isNaN(yr) && yr >= 2020 && yr <= 2060) projYearSet.add(String(yr));
+                        }
+                    });
+                    if (projYearSet.size > yearsForIso.length) {
+                        yearsForIso.length = 0;
+                        projYearSet.forEach(y => yearsForIso.push(y));
+                        // Also add any new years to the year selector so yearSelector.value = year works
+                        // correctly in processYearOnMainThread (setting to a missing option silently fails)
+                        if (yearSel) {
+                            const existingYears = new Set(Array.from(yearSel.options).map(o => o.value));
+                            projYearSet.forEach(y => {
+                                if (!existingYears.has(y)) {
+                                    const opt = document.createElement('option');
+                                    opt.value = y; opt.textContent = y;
+                                    yearSel.appendChild(opt);
+                                }
+                            });
+                        }
+                    }
+                }
+                // Final fallback: just the current year
+                if (yearsForIso.length === 0) {
+                    yearsForIso.push(yearSel?.value || String(new Date().getFullYear()));
+                }
             }
             
             // Sort years numerically to ensure base year (2024) runs first
@@ -3918,6 +3976,13 @@
                 rawGenData = data;
                 updateDropdowns(); // Potentially update ISOs
                 rebuildHourlyData();
+                // Race condition fix: if load data arrived before capacity factors,
+                // hourlyData is now available for the first time — trigger calibration.
+                console.log(`[processCapacityFactorData] hourlyData=${hourlyData.length} selectedZone=${selectedZone ? selectedZone.iso+'_'+selectedZone.zone : 'null'} rawHistoricalData=${!!rawHistoricalData} cachedCoreResults=${!!cachedCoreResults}`);
+                if (hourlyData.length > 0 && selectedZone && rawHistoricalData && !cachedCoreResults) {
+                    console.log('[processCapacityFactorData] Race condition fix firing — calling calibrateFromZone');
+                    calibrateFromZone(selectedZone.iso, selectedZone.zone);
+                }
             } else {
                 showNotification('Invalid Capacity Factor CSV', true);
             }
@@ -3928,6 +3993,15 @@
                 rawLoadData = data;
                 updateDropdowns(); // Update Years and ISOs
                 rebuildHourlyData();
+                // Race condition fix: historical prices may have loaded before load data,
+                // causing calibrateFromZone to skip runModel() because hourlyData was empty.
+                // Now that hourlyData is populated, re-trigger calibration so the model runs
+                // and the FundamentalCalibrator trains (inline training fires for base years).
+                console.log(`[processLoadData] hourlyData=${hourlyData.length} selectedZone=${selectedZone ? selectedZone.iso+'_'+selectedZone.zone : 'null'} rawHistoricalData=${!!rawHistoricalData} cachedCoreResults=${!!cachedCoreResults}`);
+                if (hourlyData.length > 0 && selectedZone && rawHistoricalData && !cachedCoreResults) {
+                    console.log('[processLoadData] Race condition fix firing — calling calibrateFromZone');
+                    calibrateFromZone(selectedZone.iso, selectedZone.zone);
+                }
             } else {
                 showNotification('Invalid Load Data CSV', true);
             }
@@ -4391,6 +4465,7 @@
         }
 
         async function calibrateFromZone(iso, zone) {
+            console.log(`[calibrateFromZone] iso=${iso} zone=${zone} hourlyData.length=${hourlyData.length}`);
             // Use normalized matching for zone lookup
             let zoneIso = iso;
             if (rawHistoricalData && rawHistoricalData.zoneMap) {
@@ -4470,16 +4545,18 @@
             if(parsed.length === 0) { showNotification("Could not parse price data for zone", true); return; }
             
             if (!calibrateFromParsedData(parsed)) { showNotification("Calibration failed for zone", true); return; }
-            
+            console.log(`[calibrateFromZone] calibrateFromParsedData succeeded. historicalAvgPrice=$${historicalAvgPrice?.toFixed(2)}`);
+
             // Update selected zone
             selectedZone = { iso, zone };
-            
+
             // Update UI
             document.getElementById('pricingConfigBtn').querySelector('span:last-child').textContent = "Calibrated";
             document.getElementById('pricingConfigBtn').querySelector('span:last-child').className = "bg-black/20 px-1.5 py-0.5 rounded text-[10px] text-prism-blue font-bold";
             etrConfig = JSON.parse(JSON.stringify(ppConfig));
-            
+
             if(hourlyData.length > 0) await runModel();
+            else console.warn('[calibrateFromZone] hourlyData is empty — runModel() skipped');
         }
 
         // --- Logic for Assumptions ---
@@ -4502,7 +4579,7 @@
         }
 
         function updateDropdowns() {
-            // Merge available ISOs and Years from Market Assumptions and Load Data
+            // Merge available ISOs and Years from Market Assumptions, Load Data, and Project Database
             const isoSet = new Set();
             const yearSet = new Set();
 
@@ -4518,6 +4595,18 @@
                     if (k !== 'Year' && k !== 'Date UTC' && k.trim() !== '') isoSet.add(k);
                 });
                 rawLoadData.forEach(r => { if(r.Year) yearSet.add(String(r.Year)); });
+            }
+
+            // Add ISOs from project database so the selector populates even without Load Data
+            if (projectDatabase) {
+                projectDatabase.forEach(proj => {
+                    if (proj.ISOTerritory && proj.ISOTerritory.trim()) isoSet.add(proj.ISOTerritory.trim());
+                });
+                // If no years exist yet (no Load Data or Assumptions), generate a default forecast range
+                if (yearSet.size === 0) {
+                    const baseYear = new Date().getFullYear();
+                    for (let y = baseYear - 1; y <= baseYear + 15; y++) yearSet.add(String(y));
+                }
             }
 
             const isoSel = document.getElementById('isoSelector');
@@ -4573,6 +4662,7 @@
             savedData = {};
             persistSavedData();
             showNotification(`Project DB Loaded: ${data.length} Projects`);
+            updateDropdowns(); // Populate ISO selector from ISOTerritory values in the DB
             applyAssumptions();
         }
 
@@ -4639,9 +4729,8 @@
 
                 const mappedId = techMap[proj.ProjectType];
                 if(mappedId) {
-                    // Read capacity from ProjectCapacityMW first, fallback to currentoperatingcapacity
-                    const mw = parseFloat(proj.ProjectCapacityMW) || parseFloat(proj.currentoperatingcapacity) || parseFloat(proj.CurrentOperatingCapacity) || 0;
-                    
+                    const mw = parseFloat(proj.ProjectCapacityMW) || parseFloat(proj.CurrentOperatingCapacity) || parseFloat(proj.CurrentOperatingCapacityMW) || 0;
+
                     // 3. Check Retirement Date - skip retired projects from capacity and dispatch
                     // A project is considered retired for year N if its retirement year is <= N
                     // We also track retirements happening specifically in year N for use when
@@ -4658,7 +4747,7 @@
                             }
                         }
                     }
-                    
+
                     // Track retirements happening in this specific year (for use when applying prior year capacity)
                     // Note: This is NOT double-counting because:
                     // - When loading directly from DB: retired projects are excluded, retirementSums is tracked but not used
@@ -4667,14 +4756,15 @@
                         retirementSums[mappedId] = (retirementSums[mappedId] || 0) + mw;
                     }
 
-                    // Skip retired projects from capacity sums and dispatch
-                    if(isRetired) return;
-                    
-                    // Track scheduled builds (projects coming online this year)
-                    // These will be treated as "new build" capacity, not existing capacity
+                    // Track scheduled builds (projects coming online this year) BEFORE retirement check
+                    // so that projects starting AND retiring in the same year are still counted as new builds
+                    // (matches how Excel counts: filter by FirstPowerDate year only)
                     if(isScheduledBuild) {
                         scheduledBuildSums[mappedId] = (scheduledBuildSums[mappedId] || 0) + mw;
                     }
+
+                    // Skip retired projects from capacity sums and dispatch
+                    if(isRetired) return;
 
                     // 4. Sum Capacity (only non-retired projects)
                     capacitySums[mappedId] = (capacitySums[mappedId] || 0) + mw;
@@ -4748,6 +4838,22 @@
                 updateThermalSliders(); // Ensure gas/coal sliders allow full capacity
             }
             
+            // Debug: log capacity and scheduled build sums for diagnosis
+            console.log(`[updateSystemFromProjectDB] ISO=${iso} Year=${year} selectedYear=${selectedYear}`);
+            console.log(`[updateSystemFromProjectDB] capacitySums:`, JSON.stringify(capacitySums));
+            console.log(`[updateSystemFromProjectDB] scheduledBuildSums:`, JSON.stringify(scheduledBuildSums));
+            console.log(`[updateSystemFromProjectDB] etrCapacities after update:`, JSON.stringify(Object.fromEntries(Object.entries(etrCapacities))));
+            // Also log any solar projects that were processed to catch filter issues
+            const solarProjects2029 = projectDatabase.filter(p => {
+                const iso_ = p.ISOTerritory;
+                if (!isoNamesMatch(iso_, iso) && !(isoNamesMatch(iso, 'CAISO') && ['SP15','NP15','ZP26'].includes(iso_))) return false;
+                if (techMap[p.ProjectType] !== 'solar') return false;
+                if (!p.FirstPowerDate) return false;
+                const d = new Date(p.FirstPowerDate);
+                return !isNaN(d.getTime()) && d.getFullYear() === selectedYear;
+            });
+            console.log(`[updateSystemFromProjectDB] Solar projects with firstPowerYear==selectedYear: ${solarProjects2029.length}, total MW: ${solarProjects2029.reduce((s, p) => s + (parseFloat(p.ProjectCapacityMW)||0), 0).toFixed(1)}`);
+
             // Show notification with retirement and scheduled build info
             const totalRetirements = Object.values(retirementSums).reduce((a, b) => a + b, 0);
             const totalScheduledBuilds = Object.values(scheduledBuildSums).reduce((a, b) => a + b, 0);
@@ -4878,6 +4984,7 @@
             });
 
             hourlyData = newHourlyData;
+            console.log(`[rebuildHourlyData] built ${hourlyData.length} hours for ISO=${iso} year=${year}`);
             checkEnableButtons();
         }
 
@@ -5110,6 +5217,7 @@
             }
 
             if (!data) {
+                console.warn(`[applyAssumptions] No assumptions data for ISO=${iso} year=${year}. Available: ${JSON.stringify(Object.keys(marketAssumptions || {}))}`);
                 updateSaveButtonState();
                 return;
             }
@@ -7202,6 +7310,8 @@
             // 2. Optimization: Pre-calculate hourly gas prices (from copilot branch)
             // This relies on the helper function you created in the "Vectorize Gas Price Scalars" step
             const hourlyGasPrices = preCalculateHourlyGasPrices(conf.gasCost);
+            const _currentYear = document.getElementById('yearSelector')?.value;
+            console.log(`[runModel] ISO=${conf.iso} year=${_currentYear} gasCost=${conf.gasCost} dispatchAssets=${dispatchAssets.length} hourlyData=${hourlyData.length} historicalAvgPrice=${historicalAvgPrice?.toFixed(2) ?? 'null'}`);
             
             // 3. Execute Core Model with the new optimized argument
             const coreResults = await runCoreModel(installedCapacities, conf, hourlyGasPrices);       
@@ -7439,7 +7549,7 @@
             const isBaseYear = baseYears.includes(String(year));
             
             let calibrationScalar = 1.0;
-            
+
             if (isBaseYear || baseScalars == null) {
                 if (historicalAvgPrice !== null && historicalAvgPrice > 0) {
                     // Calculate the model average price (excluding extreme values)
@@ -7452,18 +7562,30 @@
                             modelPriceCount++;
                         }
                     }
-                    
+
                     const modelAvgPrice = modelPriceCount > 0 ? modelPriceSum / modelPriceCount : 1.0;
-                    
+                    // Count PRICE_CAP hours (load exceeded dispatchable capacity)
+                    const priceCapCount = Array.from(fundamentalPrices).filter(p => p >= PRICE_CAP * 0.99).length;
+                    const priceCapPct = (priceCapCount / numHours * 100).toFixed(1);
+                    console.log(`[Calibration] Year=${year} histAvg=$${historicalAvgPrice.toFixed(2)} modelAvg=$${modelAvgPrice.toFixed(2)} filtered=${modelPriceCount}/${numHours} gasPrice=${gasPrice} priceCapHours=${priceCapCount}(${priceCapPct}%)`);
+                    if (priceCapCount / numHours > 0.30) {
+                        console.warn(`[Calibration] ⚠️ WARNING: ${priceCapPct}% of model hours hit PRICE_CAP ($${PRICE_CAP}/MWh). This means dispatchable capacity (thermal) is insufficient for ${priceCapPct}% of load hours. Root cause: installed capacity file is likely MISSING hydro and/or geothermal capacity. Add those project types to CEM_Installed_Capacity.csv. Calibration scalar applies only to the ${modelPriceCount} non-scarcity hours.`);
+                    }
+
                     if (modelAvgPrice > 1.0) {
                         calibrationScalar = historicalAvgPrice / modelAvgPrice;
                         calibrationScalar = Math.max(0.2, Math.min(3.0, calibrationScalar));
+                    } else {
+                        console.warn(`[Calibration] modelAvgPrice=${modelAvgPrice.toFixed(4)} <= 1.0 — scalar stays 1.0 (no calibration applied)`);
                     }
+                } else {
+                    console.warn(`[Calibration] historicalAvgPrice=${historicalAvgPrice} — not set or zero, skipping calibration`);
                 }
                 baseScalars = calibrationScalar;
             } else {
                 calibrationScalar = (typeof baseScalars === 'number' && baseScalars > 0) ? baseScalars : 1.0;
             }
+            console.log(`[Calibration] Final scalar=${calibrationScalar.toFixed(4)} isBaseYear=${isBaseYear} zone=${selectedZone ? selectedZone.iso+'_'+selectedZone.zone : 'none'}`);
             
             // Apply scalar and final clamping
             for (let i = 0; i < numHours; i++) {
@@ -8081,6 +8203,14 @@
             const scarcityThreshold = totalDispatchableCapacity * 0.95;
             let scarcityStartCost = fullDispatchStack.length ? fullDispatchStack[fullDispatchStack.length - 1].cost : 0;
             const scarcityCapacity = totalDispatchableCapacity - scarcityThreshold;
+            // Diagnostic: warn if thermal capacity is less than average net load (will cause many PRICE_CAP hours)
+            {
+                const avgNetLoad = baseNetLoad.reduce((s, v) => s + v, 0) / baseNetLoad.length;
+                console.log(`[runCoreModel] ISO=${conf.iso} thermalDispatch=${(totalDispatchableCapacity/1000).toFixed(1)} GW  avgNetLoad=${(avgNetLoad/1000).toFixed(1)} GW  ratio=${(totalDispatchableCapacity/Math.max(1,avgNetLoad)*100).toFixed(0)}%`);
+                if (totalDispatchableCapacity < avgNetLoad * 0.85) {
+                    console.warn(`[runCoreModel] ⚠️ CAPACITY WARNING: thermal dispatch (${(totalDispatchableCapacity/1000).toFixed(1)} GW) < 85% of avg net load (${(avgNetLoad/1000).toFixed(1)} GW). Expect many PRICE_CAP hours. Add missing Hydro/Geothermal/Gas capacity to CEM_Installed_Capacity.csv.`);
+                }
+            }
             
             // Calculate total system capacity for reserve margin calculation (mirrors postProcessPrices logic)
             let totalSystemCapacity = 0;
