@@ -183,7 +183,8 @@
         <button id="optimizeButton" class="prism-btn py-1.5 px-4 text-xs uppercase tracking-wide disabled:opacity-50 whitespace-nowrap" disabled>Run Optimizer</button>
         <button id="saveButton" class="prism-btn py-1.5 px-4 text-xs whitespace-nowrap" disabled aria-label="Save current year capacity settings">Save Year</button>
         <button id="optimizeAllYearsButton" class="prism-btn py-1.5 px-4 text-xs uppercase tracking-wide disabled:opacity-50 whitespace-nowrap" disabled>Optimize All Years</button>
-        <button id="exportResultsButton" class="prism-btn py-1.5 px-4 text-xs uppercase tracking-wide disabled:opacity-50 whitespace-nowrap" disabled>Export Results</button>
+        <button id="exportSummaryButton" class="prism-btn py-1.5 px-4 text-xs uppercase tracking-wide disabled:opacity-50 whitespace-nowrap" disabled>Export Summary</button>
+        <button id="export8760Button" class="prism-btn py-1.5 px-4 text-xs uppercase tracking-wide disabled:opacity-50 whitespace-nowrap" disabled>Export 8760</button>
     </div>
 
     <div class="flex-grow container mx-auto px-2 md:px-3 py-4 max-w-full">
@@ -387,6 +388,7 @@
                                             <th class="px-1 py-1 text-right text-[10px] font-bold text-prism-muted uppercase tracking-wider"><div class="th-with-info">Opex<span class="unit">($/MW-Mo)</span><span class="info-tooltip">i<span class="tooltip-text">Fixed operating expense per MW per month. Editable. Includes O&M, insurance, and other fixed costs.</span></span></div></th>
                                             <th class="px-1 py-1 text-right text-[10px] font-bold text-prism-muted uppercase tracking-wider"><div class="th-with-info">Life<span class="unit">(yrs)</span><span class="info-tooltip">i<span class="tooltip-text">Expected economic life in years. Editable. Used to amortize capex in IRR and levelized cost calculations.</span></span></div></th>
                                             <th class="px-1 py-1 text-right text-[10px] font-bold text-prism-muted uppercase tracking-wider"><div class="th-with-info">CF<span class="unit">(%)</span><span class="info-tooltip">i<span class="tooltip-text">Capacity Factor. Actual generation divided by theoretical maximum (capacity × 8760 hours). Output from simulation.</span></span></div></th>
+                                            <th class="px-1 py-1 text-right text-[10px] font-bold text-prism-muted uppercase tracking-wider"><div class="th-with-info">Dispatch<span class="unit">(MWh)</span><span class="info-tooltip">i<span class="tooltip-text">Total annual energy dispatched in MWh. Sum of hourly generation across all 8760 hours.</span></span></div></th>
                                             <th class="px-1 py-1 text-right text-[10px] font-bold text-prism-muted uppercase tracking-wider text-yellow-400"><div class="th-with-info">ELCC<span class="unit">(%)</span><span class="info-tooltip">i<span class="tooltip-text">Effective Load Carrying Capability. Capacity credit during top N peak load hours (configurable via ELCC Peak Hrs in Market Policy). Determines capacity revenue.</span></span></div></th>
                                             <th class="px-1 py-1 text-right text-[10px] font-bold text-prism-muted uppercase tracking-wider"><div class="th-with-info">Energy<span class="unit">($/MWh)</span><span class="info-tooltip">i<span class="tooltip-text">Captured energy price. Average price received per MWh generated, reflecting when the technology dispatches.</span></span></div></th>
                                             <th class="px-1 py-1 text-right text-[10px] font-bold text-prism-muted uppercase tracking-wider text-red-400"><div class="th-with-info">Carbon<span class="unit">($/MWh)</span><span class="info-tooltip">i<span class="tooltip-text">Carbon cost per MWh generated. Based on fuel consumption, emissions, and carbon price. Zero for non-emitting technologies.</span></span></div></th>
@@ -2543,9 +2545,10 @@
                             : (parseInt(slider.value) || 0));
                     const staticBaseCapacity = baselineCapacity + scheduledBuildMw;
                     
-                    // Set minimum capacity to the slider's min value (locked capacity from project DB)
+                    // Set minimum capacity to include both locked baseline AND scheduled builds,
+                    // so the optimizer cannot erase committed project-DB builds (fixes CAISO curtailment issue)
                     if (etrCapacities[tech.id] !== undefined) {
-                        minCapacity = Math.max(minCapacity, etrCapacities[tech.id]);
+                        minCapacity = Math.max(minCapacity, etrCapacities[tech.id] + scheduledBuildMw);
                     }
                     
                     // Get the annual capacity cap from the input field
@@ -3121,7 +3124,7 @@
             });
         }
 
-        async function exportResultsToCSV() {
+        async function exportResultsToCSV(mode = 'summary') {
             if (!hourlyData.length) return showNotification("Please load data first.", true);
 
             const iso = document.getElementById('isoSelector').value;
@@ -3151,8 +3154,8 @@
             // Update UI every N years to keep browser responsive without excessive delays
             const UI_UPDATE_INTERVAL_YEARS = 5;
             
-            // Show progress
-            const exportBtn = document.getElementById('exportResultsButton');
+            // Show progress on whichever button was clicked
+            const exportBtn = document.getElementById(mode === '8760' ? 'export8760Button' : 'exportSummaryButton');
             const originalText = exportBtn.textContent;
             exportBtn.disabled = true;
             
@@ -3315,6 +3318,7 @@
                         'Opex ($/MW-Mo)':            isCoal ? '' : getInputVal(`opex-${tech.id}`, 0),
                         'Life (yrs)':                isCoal ? '' : getInputVal(`life-${tech.id}`, 0),
                         'CF (%)':                    isCoal ? '' : (finData ? finData.cf.toFixed(1)           : getText(`cf-${tech.id}`, '0')),
+                        'Dispatch (TWh)':            isCoal ? '' : (finData ? (finData.totalGeneration / 1e6).toFixed(3) : ''),
                         'ELCC (%)':                  isCoal ? '' : (finData ? finData.elcc.toFixed(1)         : getInputVal(`elcc-${tech.id}`, 0)),
                         'Energy ($/MWh)':            isCoal ? '' : (finData ? finData.capturedPrice.toFixed(2): getText(`price-${tech.id}`, '0')),
                         'Cap Rev ($/MW-d)':          isCoal ? '' : (finData ? finData.capRevPerMWDay.toFixed(2): getText(`cap-rev-${tech.id}`, '0')),
@@ -3476,101 +3480,103 @@
                     elccPeakHours: parseInt(getInputVal('elcc-peak-hours', 100)) || 100
                 };
 
-                let modelResults = null;
                 let installedCapacities = {};
-                if (!hasFullSnapshot) {
-                    // No complete stored data — run model to compute results and hourly time series
-                    generationTypes.forEach(tech => {
-                        const slider = document.getElementById(`${tech.id}-slider`);
-                        if (slider) {
-                            installedCapacities[tech.id] = parseInt(slider.value) || 0;
-                        } else if (etrCapacities[tech.id] !== undefined) {
-                            installedCapacities[tech.id] = etrCapacities[tech.id];
-                        }
-                    });
+                generationTypes.forEach(tech => {
+                    const slider = document.getElementById(`${tech.id}-slider`);
+                    if (slider) {
+                        installedCapacities[tech.id] = parseInt(slider.value) || 0;
+                    } else if (etrCapacities[tech.id] !== undefined) {
+                        installedCapacities[tech.id] = etrCapacities[tech.id];
+                    }
+                });
+                // Summary mode skips the model run for fully-saved years (fast path — uses stored
+                // snapshot values patched in below). 8760 mode always runs to get hourly arrays.
+                let modelResults = null;
+                if (mode === '8760' || !hasFullSnapshot) {
                     modelResults = await runModel(true, conf, installedCapacities);
                 }
-                // hasFullSnapshot → modelResults stays null; DOM fallbacks in buildYearRows are
-                // immediately overwritten by the stored-data patch block below.
 
-                // Build tech rows for this year (long format: one row per technology)
-                const yearRows = buildYearRows(iso, year, modelResults);
+                // ── Annual summary rows (summary mode only) ───────────────────────────────────
+                if (mode === 'summary') {
+                    const yearRows = buildYearRows(iso, year, modelResults);
 
-                // ── Patch market-wide fields from stored snapshot (ensures export matches UI) ─
-                if (savedYearData?.metrics?.unservedEnergy !== undefined) {
-                    const m = savedYearData.metrics;
-                    const mktPatch = {
-                        'Unserved Energy (MWh)':               Math.round(m.unservedEnergy).toString(),
-                        'Peak Unserved Energy (MW)':           Math.round(m.peakUnservedEnergy).toString(),
-                        'Capacity Market Reserve Margin (%)':  m.capacityMarketRM.toFixed(1),
-                        'Peak Reserve Margin (%)':             m.peakReserveMargin.toFixed(1),
-                        'Renewable Share (%)':                 (m.renewableShare * 100).toFixed(1),
-                        'Clean Energy Share (%)':              (m.cleanEnergyShare * 100).toFixed(1),
-                        'Renewable Curtailment (%)':           (m.renewableCurtailment * 100).toFixed(1),
-                        'REC Price ($/MWh)':                   m.recPrice.toFixed(2),
-                        'Capacity Price ($/MW-d)':             m.capacityPrice.toFixed(2),
-                        'Total Annual Cost ($B)':              (m.totalCost / 1e9).toFixed(2),
-                        'Average Energy Price ($/MWh)':        m.avgEnergyPrice.toFixed(2),
-                    };
-                    if (m.peakLoad !== undefined) {
-                        Object.assign(mktPatch, {
-                            'Peak Load (MW)':              m.peakLoad.toFixed(2),
-                            'Average Load (MW)':           m.avgLoad.toFixed(2),
-                            'Total Annual Load (MWh)':     m.totalLoad.toFixed(2),
-                            'Peak Net Load (MW)':          m.peakNetLoad.toFixed(2),
-                            'Average Net Load (MW)':       m.avgNetLoad.toFixed(2),
-                            'Total Annual Net Load (MWh)': m.totalNetLoad.toFixed(2),
-                        });
-                    }
-                    if (m.annualGasFuelMMBtu !== undefined) {
-                        const carbonCostForRow = parseFloat(getInputVal('carbon-cost', 0));
-                        const gasCO2  = m.annualGasFuelMMBtu  * CARBON_EMISSIONS_GAS;
-                        const coalCO2 = m.annualCoalFuelMMBtu * CARBON_EMISSIONS_COAL;
-                        const oilCO2  = m.annualOilFuelMMBtu  * CARBON_EMISSIONS_OIL;
-                        const totalCO2 = gasCO2 + coalCO2 + oilCO2;
-                        Object.assign(mktPatch, {
-                            'Annual Gas Fuel (MMBtu)':   m.annualGasFuelMMBtu.toFixed(0),
-                            'Annual Coal Fuel (MMBtu)':  m.annualCoalFuelMMBtu.toFixed(0),
-                            'Annual Oil Fuel (MMBtu)':   m.annualOilFuelMMBtu.toFixed(0),
-                            'Annual Total Fuel (MMBtu)': (m.annualGasFuelMMBtu + m.annualCoalFuelMMBtu + m.annualOilFuelMMBtu).toFixed(0),
-                            'Annual Gas CO2 (Tons)':     gasCO2.toFixed(0),
-                            'Annual Coal CO2 (Tons)':    coalCO2.toFixed(0),
-                            'Annual Oil CO2 (Tons)':     oilCO2.toFixed(0),
-                            'Annual Total CO2 (Tons)':   totalCO2.toFixed(0),
-                            'Annual Carbon Cost ($)':    (totalCO2 * carbonCostForRow).toFixed(0),
-                        });
-                    }
-                    // Apply patch to ALL tech rows for this year
-                    yearRows.forEach(r => Object.assign(r, mktPatch));
-                }
-
-                // ── Patch per-tech financials from stored snapshot ─────────────────────────────
-                if (savedYearData?.techFinancials || savedYearData?.newBuilds || savedYearData?.elcc || savedYearData?.irr) {
-                    generationTypes.forEach(tech => {
-                        if (tech.id === 'coal') return;
-                        const techName = tech.id === 'imports' ? 'Tx Builds' : tech.name;
-                        const techRow = yearRows.find(r => r.Technology === techName);
-                        if (!techRow) return;
-                        const finData = savedYearData.techFinancials?.[tech.id];
-                        if (finData) {
-                            techRow['CF (%)']          = finData.cf.toFixed(1);
-                            techRow['Cap Rev ($/MW-d)'] = finData.capRevPerMWDay.toFixed(2);
-                            techRow['REC Rev ($/MWh)'] = finData.recRevPerMWh.toFixed(2);
-                            if (tech.id !== 'imports') techRow['Energy ($/MWh)'] = finData.capturedPrice.toFixed(2);
+                    // ── Patch market-wide fields from stored snapshot (ensures export matches UI) ─
+                    if (savedYearData?.metrics?.unservedEnergy !== undefined) {
+                        const m = savedYearData.metrics;
+                        const mktPatch = {
+                            'Unserved Energy (MWh)':               Math.round(m.unservedEnergy).toString(),
+                            'Peak Unserved Energy (MW)':           Math.round(m.peakUnservedEnergy).toString(),
+                            'Capacity Market Reserve Margin (%)':  m.capacityMarketRM.toFixed(1),
+                            'Peak Reserve Margin (%)':             m.peakReserveMargin.toFixed(1),
+                            'Renewable Share (%)':                 m.renewableShare.toFixed(1),
+                            'Clean Energy Share (%)':              m.cleanEnergyShare.toFixed(1),
+                            'Renewable Curtailment (%)':           m.renewableCurtailment.toFixed(1),
+                            'REC Price ($/MWh)':                   m.recPrice.toFixed(2),
+                            'Capacity Price ($/MW-d)':             m.capacityPrice.toFixed(2),
+                            'Total Annual Cost ($B)':              (m.totalCost / 1e9).toFixed(2),
+                            'Average Energy Price ($/MWh)':        m.avgEnergyPrice.toFixed(2),
+                        };
+                        if (m.peakLoad !== undefined) {
+                            Object.assign(mktPatch, {
+                                'Peak Load (MW)':              m.peakLoad.toFixed(2),
+                                'Average Load (MW)':           m.avgLoad.toFixed(2),
+                                'Total Annual Load (MWh)':     m.totalLoad.toFixed(2),
+                                'Peak Net Load (MW)':          m.peakNetLoad.toFixed(2),
+                                'Average Net Load (MW)':       m.avgNetLoad.toFixed(2),
+                                'Total Annual Net Load (MWh)': m.totalNetLoad.toFixed(2),
+                            });
                         }
-                        const storedElcc = savedYearData.elcc?.[tech.id];
-                        if (storedElcc !== undefined) techRow['ELCC (%)'] = (storedElcc * 100).toFixed(1);
-                        const storedIrr = savedYearData.irr?.[tech.id];
-                        if (storedIrr !== undefined) techRow['IRR (%)'] = !isNaN(storedIrr) ? storedIrr.toFixed(1) : '0.0';
-                        const storedBuild = savedYearData.newBuilds?.[tech.id];
-                        if (storedBuild !== undefined) techRow['New Build (MW)'] = storedBuild;
-                    });
-                }
+                        if (m.annualGasFuelMMBtu !== undefined) {
+                            const carbonCostForRow = parseFloat(getInputVal('carbon-cost', 0));
+                            const gasCO2  = m.annualGasFuelMMBtu  * CARBON_EMISSIONS_GAS;
+                            const coalCO2 = m.annualCoalFuelMMBtu * CARBON_EMISSIONS_COAL;
+                            const oilCO2  = m.annualOilFuelMMBtu  * CARBON_EMISSIONS_OIL;
+                            const totalCO2 = gasCO2 + coalCO2 + oilCO2;
+                            Object.assign(mktPatch, {
+                                'Annual Gas Fuel (MMBtu)':   m.annualGasFuelMMBtu.toFixed(0),
+                                'Annual Coal Fuel (MMBtu)':  m.annualCoalFuelMMBtu.toFixed(0),
+                                'Annual Oil Fuel (MMBtu)':   m.annualOilFuelMMBtu.toFixed(0),
+                                'Annual Total Fuel (MMBtu)': (m.annualGasFuelMMBtu + m.annualCoalFuelMMBtu + m.annualOilFuelMMBtu).toFixed(0),
+                                'Annual Gas CO2 (Tons)':     gasCO2.toFixed(0),
+                                'Annual Coal CO2 (Tons)':    coalCO2.toFixed(0),
+                                'Annual Oil CO2 (Tons)':     oilCO2.toFixed(0),
+                                'Annual Total CO2 (Tons)':   totalCO2.toFixed(0),
+                                'Annual Carbon Cost ($)':    (totalCO2 * carbonCostForRow).toFixed(0),
+                            });
+                        }
+                        // Apply patch to ALL tech rows for this year
+                        yearRows.forEach(r => Object.assign(r, mktPatch));
+                    }
 
-                allRows.push(...yearRows);
+                    // ── Patch per-tech financials from stored snapshot ─────────────────────────
+                    if (savedYearData?.techFinancials || savedYearData?.newBuilds || savedYearData?.elcc || savedYearData?.irr) {
+                        generationTypes.forEach(tech => {
+                            if (tech.id === 'coal') return;
+                            const techName = tech.id === 'imports' ? 'Tx Builds' : tech.name;
+                            const techRow = yearRows.find(r => r.Technology === techName);
+                            if (!techRow) return;
+                            const finData = savedYearData.techFinancials?.[tech.id];
+                            if (finData) {
+                                techRow['CF (%)']          = finData.cf.toFixed(1);
+                                techRow['Cap Rev ($/MW-d)'] = finData.capRevPerMWDay.toFixed(2);
+                                techRow['REC Rev ($/MWh)'] = finData.recRevPerMWh.toFixed(2);
+                                if (tech.id !== 'imports') techRow['Energy ($/MWh)'] = finData.capturedPrice.toFixed(2);
+                                if (finData.totalGeneration !== undefined) techRow['Dispatch (TWh)'] = (finData.totalGeneration / 1e6).toFixed(3);
+                            }
+                            const storedElcc = savedYearData.elcc?.[tech.id];
+                            if (storedElcc !== undefined) techRow['ELCC (%)'] = (storedElcc * 100).toFixed(1);
+                            const storedIrr = savedYearData.irr?.[tech.id];
+                            if (storedIrr !== undefined) techRow['IRR (%)'] = !isNaN(storedIrr) ? storedIrr.toFixed(1) : '0.0';
+                            const storedBuild = savedYearData.newBuilds?.[tech.id];
+                            if (storedBuild !== undefined) techRow['New Build (MW)'] = storedBuild;
+                        });
+                    }
+
+                    allRows.push(...yearRows);
+                }
                 
-                // Collect hourly time series data for this year
-                if (modelResults && modelResults.hourlyGeneration && modelResults.hourlyPrices && 
+                // Collect hourly time series data for this year (8760 mode only)
+                if (mode === '8760' && modelResults && modelResults.hourlyGeneration && modelResults.hourlyPrices &&
                     modelResults.netLoad && modelResults.netLoadAfterStorage) {
                     
                     // Extract historical prices for the current year being exported
@@ -3791,7 +3797,7 @@
                 hourlyLink.style.visibility = 'hidden';
                 document.body.appendChild(hourlyLink);
                 
-                // Delay to ensure the first download starts before triggering the second
+                showNotification(`Exported 8760 hourly data for ${allHourlyRows.length / 8760} year(s) for ${iso}`);
                 setTimeout(() => {
                     hourlyLink.click();
                     document.body.removeChild(hourlyLink);
@@ -6459,7 +6465,7 @@
                 const elccCell = `<td class="px-1 py-1"><input type="number" id="elcc-${x.id}" value="0.0" step="0.1" min="0" max="100" class="financial-input text-yellow-400 font-bold" data-elcc-override="false"></td>`;
                 // Hidden input for cost curve distribution (controlled by CSV upload only)
                 const hiddenCostCurve = `<input type="hidden" id="cost-curve-dist-${x.id}" value="20">`;
-                r.innerHTML=`<td class="px-1 py-1 whitespace-nowrap font-medium text-prism-text">${name}</td><td id="new-build-${x.id}" class="px-1 py-1 text-right text-prism-green font-mono font-bold">0</td><td class="px-1 py-1"><input type="number" id="ann-cap-${x.id}" value="${defaultAnnCap}" step="100" min="0" class="financial-input" ${annCapDisabled}></td><td class="px-1 py-1"><input type="number" id="capex-${x.id}" value="${x.capex}" class="financial-input"></td><td class="px-1 py-1"><input type="number" id="opex-${x.id}" value="${x.opex}" class="financial-input"></td><td class="px-1 py-1"><input type="number" id="life-${x.id}" value="${x.life}" class="financial-input"></td><td id="cf-${x.id}" class="px-1 py-1 text-right text-prism-muted font-mono">0.0</td>${elccCell}${energyCell}<td id="carbon-cost-${x.id}" class="px-1 py-1 text-right text-red-400 font-mono">0.00</td><td id="cap-rev-${x.id}" class="px-1 py-1 text-right text-green-400 font-mono">0.00</td><td id="rec-rev-${x.id}" class="px-1 py-1 text-right text-blue-400 font-mono">0.00</td><td class="px-1 py-1"><input type="number" id="as-rev-${x.id}" value="0" step="0.1" min="0" class="financial-input"></td><td class="px-1 py-1"><input type="number" id="hurdle-${x.id}" value="${x.hurdleRate}" class="financial-input"></td><td id="irr-${x.id}" class="px-1 py-1 text-right font-mono font-bold text-white">0.0</td>${hiddenCostCurve}`; 
+                r.innerHTML=`<td class="px-1 py-1 whitespace-nowrap font-medium text-prism-text">${name}</td><td id="new-build-${x.id}" class="px-1 py-1 text-right text-prism-green font-mono font-bold">0</td><td class="px-1 py-1"><input type="number" id="ann-cap-${x.id}" value="${defaultAnnCap}" step="100" min="0" class="financial-input" ${annCapDisabled}></td><td class="px-1 py-1"><input type="number" id="capex-${x.id}" value="${x.capex}" class="financial-input"></td><td class="px-1 py-1"><input type="number" id="opex-${x.id}" value="${x.opex}" class="financial-input"></td><td class="px-1 py-1"><input type="number" id="life-${x.id}" value="${x.life}" class="financial-input"></td><td id="cf-${x.id}" class="px-1 py-1 text-right text-prism-muted font-mono">0.0</td><td id="dispatch-${x.id}" class="px-1 py-1 text-right text-prism-muted font-mono">0</td>${elccCell}${energyCell}<td id="carbon-cost-${x.id}" class="px-1 py-1 text-right text-red-400 font-mono">0.00</td><td id="cap-rev-${x.id}" class="px-1 py-1 text-right text-green-400 font-mono">0.00</td><td id="rec-rev-${x.id}" class="px-1 py-1 text-right text-blue-400 font-mono">0.00</td><td class="px-1 py-1"><input type="number" id="as-rev-${x.id}" value="0" step="0.1" min="0" class="financial-input"></td><td class="px-1 py-1"><input type="number" id="hurdle-${x.id}" value="${x.hurdleRate}" class="financial-input"></td><td id="irr-${x.id}" class="px-1 py-1 text-right font-mono font-bold text-white">0.0</td>${hiddenCostCurve}`;
             });
             
             // Populate UI cache after table creation to speed up updateFinancialTable
@@ -6497,6 +6503,7 @@
                 
                 cacheElement(`new-build-${tech.id}`);
                 cacheElement(`cf-${tech.id}`);
+                cacheElement(`dispatch-${tech.id}`);
                 cacheElement(`elcc-${tech.id}`);
                 cacheElement(`price-${tech.id}`);
                 cacheElement(`carbon-cost-${tech.id}`);
@@ -6515,7 +6522,8 @@
             document.getElementById('dailyGasPricesFile').addEventListener('change', handleDailyGasPricesUpload);
             document.getElementById('optimizeButton').addEventListener('click', runOptimizer);
             document.getElementById('optimizeAllYearsButton').addEventListener('click', optimizeAllYears);
-            document.getElementById('exportResultsButton').addEventListener('click', exportResultsToCSV);
+            document.getElementById('exportSummaryButton').addEventListener('click', () => exportResultsToCSV('summary'));
+            document.getElementById('export8760Button').addEventListener('click', () => exportResultsToCSV('8760'));
             document.getElementById('resetDefaults').addEventListener('click', resetToDefaults);
             document.getElementById('saveButton').addEventListener('click', saveCurrentYear);
             // Clear cache and apply assumptions when ISO changes to prevent stale data from affecting calculations
@@ -6630,7 +6638,8 @@
             ['sliders-container', 'costs-container'].forEach(id => document.getElementById(id).classList.remove('opacity-50', 'pointer-events-none'));
             document.getElementById('optimizeButton').disabled = false;
             document.getElementById('optimizeAllYearsButton').disabled = false;
-            document.getElementById('exportResultsButton').disabled = false;
+            document.getElementById('exportSummaryButton').disabled = false;
+            document.getElementById('export8760Button').disabled = false;
             document.getElementById('results-placeholder').classList.add('hidden');
             document.getElementById('results-content').classList.remove('hidden');
             document.getElementById('charts-container').classList.remove('hidden');
@@ -7009,7 +7018,8 @@
                             cf: financials[tech.id].cf,
                             capturedPrice: financials[tech.id].capturedPrice,
                             capRevPerMWDay: financials[tech.id].capRevPerMWDay,
-                            recRevPerMWh: financials[tech.id].recRevPerMWh
+                            recRevPerMWh: financials[tech.id].recRevPerMWh,
+                            totalGeneration: financials[tech.id].totalGeneration
                         };
                     }
                 });
@@ -7184,7 +7194,8 @@
                 if(data) {
                     set(`new-build-${tech.id}`, Math.round(data.newBuild).toLocaleString());
                     set(`cf-${tech.id}`, data.cf.toFixed(1));
-                    
+                    set(`dispatch-${tech.id}`, Math.round(data.totalGeneration).toLocaleString());
+
                     // ELCC: Update only if not user-overridden
                     const elccInput = uiCache[`elcc-${tech.id}`];
                     if (elccInput) {
@@ -8767,13 +8778,14 @@
                 // Use previous IRR as starting guess, converting from percentage to decimal
                 const prevIRR = prevIRRs[tech.id];
                 const guess = (prevIRR !== undefined && !isNaN(prevIRR)) ? prevIRR / 100 : 0.1;
-                results[tech.id] = { 
+                results[tech.id] = {
                     newBuild: Math.max(0, capacity - (etrCapacities[tech.id] || 0)),
-                    cf: capacity > 0 ? (totalGen / (capacity * 8760)) * 100 : 0, 
-                    capturedPrice: capturedPriceDisplay, 
+                    cf: capacity > 0 ? (totalGen / (capacity * 8760)) * 100 : 0,
+                    totalGeneration: totalGen,
+                    capturedPrice: capturedPriceDisplay,
                     carbonCostPerMWh: carbonCostPerMWh,
-                    irr: calculateIRR_WithPTC(investment, baseCashFlow, ptcRevenue, parseInt(document.getElementById(`life-${tech.id}`).value), guess, tech.id), 
-                    capRevPerMWDay: marketMetrics.capacityPrice * effectiveElcc, 
+                    irr: calculateIRR_WithPTC(investment, baseCashFlow, ptcRevenue, parseInt(document.getElementById(`life-${tech.id}`).value), guess, tech.id),
+                    capRevPerMWDay: marketMetrics.capacityPrice * effectiveElcc,
                     recRevPerMWh: totalGen > 0 ? recRevenue / totalGen : 0,
                     elcc: effectiveElcc * 100
                 };
@@ -8996,11 +9008,11 @@
             if (!isoEl) return;
             const iso = isoEl.value;
             if (!iso) return;
-            
+
             const ctx = document.getElementById('multiYearCapacityChart');
             if (!ctx) return;
             if (multiYearCapacityChart) multiYearCapacityChart.destroy();
-            
+
             // Get all years for this ISO from savedData
             const isoData = savedData[iso];
             if (!isoData || Object.keys(isoData).length === 0) {
@@ -9021,10 +9033,10 @@
                 updateAnnualCapacityAddsChart();
                 return;
             }
-            
+
             // Sort years numerically
             const years = Object.keys(isoData).sort((a, b) => parseInt(a) - parseInt(b));
-            
+
             // Build datasets for each technology
             const datasets = [];
             generationTypes.forEach(tech => {
@@ -9035,7 +9047,7 @@
                     }
                     return 0;
                 });
-                
+
                 // Only add dataset if there's any non-zero data
                 if (data.some(v => v > 0)) {
                     datasets.push({
@@ -9048,10 +9060,10 @@
                     });
                 }
             });
-            
+
             // Sort datasets so Solar, Onshore Wind, Offshore Wind appear at top of stack
             sortDatasetsByStackOrder(datasets);
-            
+
             multiYearCapacityChart = new Chart(ctx.getContext('2d'), {
                 type: 'bar',
                 data: {
@@ -9072,11 +9084,11 @@
                     }
                 }
             });
-            
+
             // Also update the annual capacity adds chart
             updateAnnualCapacityAddsChart();
         }
-        
+
         function updateAnnualCapacityAddsChart() {
             const isoEl = document.getElementById('isoSelector');
             if (!isoEl) return;
