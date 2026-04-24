@@ -3254,6 +3254,7 @@
                     const co2Total = co2Gas + co2Coal + co2Oil;
                     const carbonCostVal = parseFloat(getInputVal('carbon-cost', 0));
                     mktResults['Annual Gas Fuel (MMBtu)']   = annGas.toFixed(0);
+                    mktResults['Gas Burn (Bcfd)']           = (annGas / 365 / 1e6).toFixed(4);
                     mktResults['Annual Coal Fuel (MMBtu)']  = annCoal.toFixed(0);
                     mktResults['Annual Oil Fuel (MMBtu)']   = annOil.toFixed(0);
                     mktResults['Annual Total Fuel (MMBtu)'] = (annGas + annCoal + annOil).toFixed(0);
@@ -3308,24 +3309,24 @@
                 generationTypes.forEach(tech => {
                     if (tech.id === 'imports') return; // handled separately below
                     const finData = financialsData?.[tech.id];
-                    const isCoal = (tech.id === 'coal');
+                    const isRetireOnly = (tech.id === 'coal' || tech.id === 'oil' || tech.id === 'other');
                     rows.push({
                         ISO: isoName, Date: dateStr, Year: yearVal, Technology: tech.name,
                         'Installed Capacity (MW)': getInputVal(`${tech.id}-slider`, 0),
-                        'New Build (MW)':            isCoal ? '' : getText(`new-build-${tech.id}`, '0').replace(/,/g, ''),
-                        'Ann Cap (MW)':              isCoal ? '' : getInputVal(`ann-cap-${tech.id}`, 0),
-                        'Capex ($/kW)':              isCoal ? '' : getInputVal(`capex-${tech.id}`, 0),
-                        'Opex ($/MW-Mo)':            isCoal ? '' : getInputVal(`opex-${tech.id}`, 0),
-                        'Life (yrs)':                isCoal ? '' : getInputVal(`life-${tech.id}`, 0),
-                        'CF (%)':                    isCoal ? '' : (finData ? finData.cf.toFixed(1)           : getText(`cf-${tech.id}`, '0')),
-                        'Dispatch (TWh)':            isCoal ? '' : (finData ? (finData.totalGeneration / 1e6).toFixed(3) : ''),
-                        'ELCC (%)':                  isCoal ? '' : (finData ? finData.elcc.toFixed(1)         : getInputVal(`elcc-${tech.id}`, 0)),
-                        'Energy ($/MWh)':            isCoal ? '' : (finData ? finData.capturedPrice.toFixed(2): getText(`price-${tech.id}`, '0')),
-                        'Cap Rev ($/MW-d)':          isCoal ? '' : (finData ? finData.capRevPerMWDay.toFixed(2): getText(`cap-rev-${tech.id}`, '0')),
-                        'REC Rev ($/MWh)':           isCoal ? '' : (finData ? finData.recRevPerMWh.toFixed(2) : getText(`rec-rev-${tech.id}`, '0')),
-                        'AS Rev Adder ($/MW-Mo)':    isCoal ? '' : getInputVal(`as-rev-${tech.id}`, 0),
-                        'Hurdle (%)':                isCoal ? '' : getInputVal(`hurdle-${tech.id}`, 0),
-                        'IRR (%)':                   isCoal ? '' : (finData && !isNaN(finData.irr) ? finData.irr.toFixed(1) : getText(`irr-${tech.id}`, '0')),
+                        'New Build (MW)':            isRetireOnly ? '' : getText(`new-build-${tech.id}`, '0').replace(/,/g, ''),
+                        'Ann Cap (MW)':              isRetireOnly ? '' : getInputVal(`ann-cap-${tech.id}`, 0),
+                        'Capex ($/kW)':              isRetireOnly ? '' : getInputVal(`capex-${tech.id}`, 0),
+                        'Opex ($/MW-Mo)':            isRetireOnly ? '' : getInputVal(`opex-${tech.id}`, 0),
+                        'Life (yrs)':                isRetireOnly ? '' : getInputVal(`life-${tech.id}`, 0),
+                        'CF (%)':                    isRetireOnly ? '' : (finData ? finData.cf.toFixed(1)           : getText(`cf-${tech.id}`, '0')),
+                        'Dispatch (TWh)':            finData ? (finData.totalGeneration / 1e6).toFixed(3) : '',
+                        'ELCC (%)':                  isRetireOnly ? '' : (finData ? finData.elcc.toFixed(1)         : getInputVal(`elcc-${tech.id}`, 0)),
+                        'Energy ($/MWh)':            isRetireOnly ? '' : (finData ? finData.capturedPrice.toFixed(2): getText(`price-${tech.id}`, '0')),
+                        'Cap Rev ($/MW-d)':          isRetireOnly ? '' : (finData ? finData.capRevPerMWDay.toFixed(2): getText(`cap-rev-${tech.id}`, '0')),
+                        'REC Rev ($/MWh)':           isRetireOnly ? '' : (finData ? finData.recRevPerMWh.toFixed(2) : getText(`rec-rev-${tech.id}`, '0')),
+                        'AS Rev Adder ($/MW-Mo)':    isRetireOnly ? '' : getInputVal(`as-rev-${tech.id}`, 0),
+                        'Hurdle (%)':                isRetireOnly ? '' : getInputVal(`hurdle-${tech.id}`, 0),
+                        'IRR (%)':                   isRetireOnly ? '' : (finData && !isNaN(finData.irr) ? finData.irr.toFixed(1) : getText(`irr-${tech.id}`, '0')),
                         ...marketWide
                     });
                 });
@@ -3534,6 +3535,7 @@
                             const totalCO2 = gasCO2 + coalCO2 + oilCO2;
                             Object.assign(mktPatch, {
                                 'Annual Gas Fuel (MMBtu)':   m.annualGasFuelMMBtu.toFixed(0),
+                                'Gas Burn (Bcfd)':           (m.annualGasFuelMMBtu / 365 / 1e6).toFixed(4),
                                 'Annual Coal Fuel (MMBtu)':  m.annualCoalFuelMMBtu.toFixed(0),
                                 'Annual Oil Fuel (MMBtu)':   m.annualOilFuelMMBtu.toFixed(0),
                                 'Annual Total Fuel (MMBtu)': (m.annualGasFuelMMBtu + m.annualCoalFuelMMBtu + m.annualOilFuelMMBtu).toFixed(0),
@@ -3551,7 +3553,13 @@
                     // ── Patch per-tech financials from stored snapshot ─────────────────────────
                     if (savedYearData?.techFinancials || savedYearData?.newBuilds || savedYearData?.elcc || savedYearData?.irr) {
                         generationTypes.forEach(tech => {
-                            if (tech.id === 'coal') return;
+                            if (tech.id === 'coal' || tech.id === 'oil' || tech.id === 'other') {
+                                const techRow = yearRows.find(r => r.Technology === tech.name);
+                                if (!techRow) return;
+                                const finData = savedYearData.techFinancials?.[tech.id];
+                                if (finData?.totalGeneration !== undefined) techRow['Dispatch (TWh)'] = (finData.totalGeneration / 1e6).toFixed(3);
+                                return;
+                            }
                             const techName = tech.id === 'imports' ? 'Tx Builds' : tech.name;
                             const techRow = yearRows.find(r => r.Technology === techName);
                             if (!techRow) return;
@@ -3684,6 +3692,7 @@
                         
                         // Add fuel and emissions to hourly row
                         hourlyRow['Gas_Fuel_MMBtu'] = totalGasFuelMMBtu.toFixed(2);
+                        hourlyRow['Gas_Burn_Bcfd'] = (totalGasFuelMMBtu * 24 / 1e6).toFixed(6);
                         hourlyRow['Coal_Fuel_MMBtu'] = totalCoalFuelMMBtu.toFixed(2);
                         hourlyRow['Oil_Fuel_MMBtu'] = totalOilFuelMMBtu.toFixed(2);
                         hourlyRow['Total_Fuel_MMBtu'] = (totalGasFuelMMBtu + totalCoalFuelMMBtu + totalOilFuelMMBtu).toFixed(2);
@@ -7189,7 +7198,11 @@
 
             // Update Table using cached elements
             generationTypes.forEach(tech => {
-                if(tech.id === 'coal' || tech.id === 'oil' || tech.id === 'other') return;
+                if(tech.id === 'coal' || tech.id === 'oil' || tech.id === 'other') {
+                    const data = financials[tech.id];
+                    if(data) set(`dispatch-${tech.id}`, Math.round(data.totalGeneration).toLocaleString());
+                    return;
+                }
                 const data = financials[tech.id];
                 if(data) {
                     set(`new-build-${tech.id}`, Math.round(data.newBuild).toLocaleString());
@@ -8687,7 +8700,17 @@
             });
             const results = {};
             generationTypes.forEach(tech => {
-                if (tech.id === 'coal' || tech.id === 'oil' || tech.id === 'other') return;
+                if (tech.id === 'coal' || tech.id === 'oil' || tech.id === 'other') {
+                    const totalGen = finCalcs[tech.id].totalGeneration;
+                    const totalRev = finCalcs[tech.id].totalRevenue;
+                    results[tech.id] = {
+                        totalGeneration: totalGen,
+                        capturedPrice: totalGen > 0 ? totalRev / totalGen : 0,
+                        cf: 0, elcc: 0, irr: NaN, capRevPerMWDay: 0, recRevPerMWh: 0,
+                        carbonCostPerMWh: 0, newBuild: 0
+                    };
+                    return;
+                }
                 const capacity = installedCapacities[tech.id];
                 const totalGen = finCalcs[tech.id].totalGeneration;
                 let energyRev = finCalcs[tech.id].totalRevenue;
