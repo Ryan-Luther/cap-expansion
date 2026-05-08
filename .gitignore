@@ -27,3 +27,7 @@ test_price_metrics_fix.html
 # Allow test input data
 !Test Input Data/
 !Test Input Data/*.csv
+
+# Calibration harness artifacts (debug logs/screenshots) and local Claude state
+tools/debug/
+.claude/
