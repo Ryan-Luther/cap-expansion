@@ -1866,11 +1866,12 @@
         }
 
         // Helper function to normalize ISO names (treat ISONE and ISO-NE as the same,
-        // and map SERC→SE and WECC→WEST to align Assumptions file naming with Load/CF/HistPrices files)
+        // and map SERC→SE, WECC→WEST, NEISO→ISONE to align the new CEM_Hist_Prices
+        // naming with the Load/CF/Assumptions/Daily-Gas files which use SE/WEST/ISONE)
         function normalizeISOName(isoName) {
             if (!isoName) return isoName;
             const normalized = isoName.toUpperCase().replace(/-/g, '');
-            const aliases = { 'SERC': 'SE', 'WECC': 'WEST' };
+            const aliases = { 'SERC': 'SE', 'WECC': 'WEST', 'NEISO': 'ISONE' };
             return aliases[normalized] || normalized;
         }
 
@@ -1879,11 +1880,45 @@
             return normalizeISOName(iso1) === normalizeISOName(iso2);
         }
 
+        // Dictionary mapping OLD/canonical zone tokens (used by Load, Daily Gas Prices,
+        // Installed Capacity, OLD_CEM_Hist_Prices) to the NEW zone tokens that appear in
+        // CEM_Hist_Prices.csv. Keyed by canonical ISO (after normalizeISOName so SERC=SE,
+        // WECC=WEST, NEISO=ISONE). Best-guess geographic correspondences; only zones whose
+        // token actually changed are listed — identical tokens (e.g. CAISO NP15/SP15, MISO 1-8,
+        // most ISONE/WEST zones) and new-only zones (e.g. NYISO B-K, MISO 5/7/9/10, PJM AECO/
+        // DAY/PSEG, WEST SRP/PSCO) pass through unchanged.
+        const OLD_TO_NEW_ZONE = {
+            ERCOT: { 'COAST': 'HOUSTON' },                 // ERCOT Coast region ≈ Houston load zone
+            PJM:   { 'AP': 'APS',                          // Allegheny Power Systems
+                     'DP&L': 'DPL',                        // Delmarva Power & Light (punctuation dropped)
+                     'PENELEC': 'PENNELEC' },              // Pennsylvania Electric (spelling)
+            SE:    { 'SCEG': 'DESC' },                     // SCE&G → Dominion Energy South Carolina
+            SPP:   { 'WAPA': 'WACM' }                      // WAPA Colorado-Missouri BA in SPP footprint
+        };
+        // Reverse view: NEW token (as found in the loaded file) -> OLD/canonical token,
+        // per canonical ISO. This is what we apply when ingesting CEM_Hist_Prices so the
+        // parsed zones line up with the naming used everywhere else in the model.
+        const NEW_TO_OLD_ZONE = Object.fromEntries(
+            Object.entries(OLD_TO_NEW_ZONE).map(([iso, m]) => [
+                iso,
+                Object.fromEntries(Object.entries(m).map(([oldZone, newZone]) => [newZone, oldZone]))
+            ])
+        );
+
         // Helper function to parse ISO and zone from column header
         function parseZoneFromHeader(header, type) {
             const pattern = type === 'lmp' ? /^([A-Z]+)_(.+)\s+LMP/ : /^([A-Z]+)_(.+)\s+Gas Price/;
             const match = header.match(pattern);
-            return match ? { iso: match[1], zone: match[2] } : null;
+            if (!match) return null;
+            // Normalize ISO (NEISO→ISONE, SERC→SE, WECC→WEST) so the parsed zones align
+            // with the ISO naming used by the Load / Capacity / Assumptions files.
+            const iso = normalizeISOName(match[1]);
+            let zone = match[2];
+            // Translate the new file's renamed zone tokens back to the canonical names.
+            if (NEW_TO_OLD_ZONE[iso] && NEW_TO_OLD_ZONE[iso][zone]) {
+                zone = NEW_TO_OLD_ZONE[iso][zone];
+            }
+            return { iso, zone };
         }
 
         /**
@@ -1930,7 +1965,7 @@
             const columns = Object.keys(firstRow);
 
             // Look for date columns - prioritize exact matches first
-            const possibleDateNames = ['snapshots', 'date', 'datetime', 'timestamp'];
+            const possibleDateNames = ['snapshots', 'datetime_utc', 'date', 'datetime', 'timestamp'];
             
             // First pass: look for exact matches
             for (const col of columns) {
@@ -4039,7 +4074,7 @@
                             else if (fileHeaders.includes('Date UTC') && fileHeaders.includes('Year')) fileType = 'load';
                             else if (fileHeaders.includes('Heat_Rate') && fileHeaders.includes('Asset_ID')) fileType = 'dispatch';
                             else if (fileHeaders.includes('Current Installed Capacity (MW)')) fileType = 'capacity';
-                            else if (fileHeaders.includes('Snapshots') && fileHeaders.some(h => h.includes('LMP ($/MWh)'))) fileType = 'historical_zones';
+                            else if (fileHeaders.some(h => h.includes('LMP ($/MWh)')) && fileHeaders.some(h => ['snapshots','datetime_utc','date','datetime','timestamp','time'].includes(normalizeColumnName(h)))) fileType = 'historical_zones';
                             else if (fileHeaders.includes('Power ($)') || fileHeaders.includes('Gas ($)')) fileType = 'historical';
                             else if (fileHeaders.includes('ISO') && fileHeaders.includes('Year') && fileHeaders.includes('Capex ($/kW)')) fileType = 'assumptions';
                             else if (fileHeaders.includes('ENVProjectID') && fileHeaders.includes('ProjectName') && fileHeaders.includes('ISOTerritory')) fileType = 'project_db';
@@ -4645,7 +4680,7 @@
             }
             
             // Auto-detect date column name
-            const possibleDateCols = ['Snapshots', 'Date', 'Timestamp', 'DateTime', 'Time', 'date', 'timestamp'];
+            const possibleDateCols = ['Snapshots', 'datetime_utc', 'Date', 'Timestamp', 'DateTime', 'Time', 'date', 'timestamp'];
             let dateCol = null;
             const sampleRow = data[0];
             for (const col of possibleDateCols) {
@@ -5894,8 +5929,8 @@
             // Create a signature for this dataset (row count + first timestamp + last timestamp)
             const firstRow = historicalData[0];
             const lastRow = historicalData[historicalData.length - 1];
-            const firstTimestamp = firstRow?.Snapshots || firstRow?.Date || firstRow?.DateTime || firstRow?.Timestamp || '';
-            const lastTimestamp = lastRow?.Snapshots || lastRow?.Date || lastRow?.DateTime || lastRow?.Timestamp || '';
+            const firstTimestamp = firstRow?.Snapshots || firstRow?.datetime_utc || firstRow?.Date || firstRow?.DateTime || firstRow?.Timestamp || '';
+            const lastTimestamp = lastRow?.Snapshots || lastRow?.datetime_utc || lastRow?.Date || lastRow?.DateTime || lastRow?.Timestamp || '';
             const dataSignature = `${historicalData.length}_${firstTimestamp}_${lastTimestamp}`;
             
             // Return cached results if we've already processed this exact dataset
@@ -5916,7 +5951,7 @@
             
             // Look for date/time columns (case-insensitive, whitespace-tolerant)
             // Prioritize exact matches first
-            const possibleDateNames = ['snapshots', 'date', 'datetime', 'timestamp'];
+            const possibleDateNames = ['snapshots', 'datetime_utc', 'date', 'datetime', 'timestamp'];
             const possibleYearNames = ['year'];
             
             // First pass: look for exact matches in date columns
