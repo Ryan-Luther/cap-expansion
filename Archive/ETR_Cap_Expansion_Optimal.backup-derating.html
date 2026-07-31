@@ -203,30 +203,8 @@
                             <div id="drop-zone" class="p-6 rounded flex flex-col items-center justify-center cursor-pointer hover:bg-white/5">
                                 <svg class="w-8 h-8 text-prism-muted mb-2 pointer-events-none" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"></path></svg>
                                 <p class="text-[11px] font-bold text-prism-muted text-center pointer-events-none">DRAG & DROP ALL FILES HERE</p>
-                                <p class="text-[9px] text-prism-muted/60 text-center mt-1 pointer-events-none">Auto-detects: Cap Factors, Load, Projects, Assumptions, Daily Gas Prices, Outages</p>
+                                <p class="text-[9px] text-prism-muted/60 text-center mt-1 pointer-events-none">Auto-detects: Cap Factors, Load, Projects, Assumptions, Daily Gas Prices</p>
                                 <div id="drop-feedback" class="mt-2 flex flex-col gap-1 w-full"></div>
-                            </div>
-
-                            <div class="border-t border-prism-border my-2"></div>
-
-                            <div class="flex justify-between items-center">
-                                <label for="derating-toggle" class="text-[11px] font-bold text-prism-muted cursor-pointer flex items-center gap-1">Apply Hourly Derating<span class="info-tooltip">i<span class="tooltip-text">When enabled (and an hourly outage file is loaded), each technology's available capacity is reduced hour-by-hour by its outage rate. Applies only to the dispatch algorithm, merit-order raw price, and reserve-margin metric. Existing gas uses the CC_GAS series; nuclear is derated into net load. ELCC/accreditation, capacity market, and financial formulas are unaffected.</span></span></label>
-                                <label class="relative inline-flex items-center cursor-pointer">
-                                  <input type="checkbox" id="derating-toggle" name="derating-toggle" class="sr-only peer">
-                                  <div class="w-9 h-5 bg-prism-input peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-prism-green"></div>
-                                </label>
-                            </div>
-                            <div id="derating-status" class="text-[9px] text-prism-muted/60 mt-1">No outage file loaded</div>
-                            <div class="flex justify-between items-center mt-2">
-                                <label for="eford-derive-toggle" class="text-[11px] font-bold text-prism-muted cursor-pointer flex items-center gap-1">Derive EFORd from Outages<span class="info-tooltip">i<span class="tooltip-text">Capacity-accreditation only (independent of dispatch derating). When on, each technology's EFORd (used for ELCC / Planning Reserve Margin) is derived from the outage file as 1 minus its LOLP-weighted average availability — concentrating on peak reliability hours, so planned maintenance (scheduled off-peak) is largely excluded. Techs absent from the file (hydro, biomass, geothermal) keep their NERC values. Default off.</span></span></label>
-                                <label class="relative inline-flex items-center cursor-pointer">
-                                  <input type="checkbox" id="eford-derive-toggle" name="eford-derive-toggle" class="sr-only peer">
-                                  <div class="w-9 h-5 bg-prism-input peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-prism-green"></div>
-                                </label>
-                            </div>
-                            <div>
-                                <label for="outageFile" class="block text-[10px] text-prism-muted mb-1">Hourly Outages (.csv)</label>
-                                <input type="file" id="outageFile" name="outageFile" accept=".csv" class="block w-full text-xs text-prism-muted file:mr-2 file:py-1 file:px-2 file:rounded-sm file:border-0 file:text-[10px] file:font-medium file:bg-prism-input file:text-prism-text hover:file:bg-prism-border cursor-pointer border border-prism-border bg-prism-bg">
                             </div>
 
                             <div class="border-t border-prism-border my-2"></div>
@@ -696,18 +674,16 @@
 
         // Returns the annual build cap for a given year and tech.
         //
-        // The installed-capacity source has no Interconnection Agreement / Under Construction status,
-        // so the committed pipeline is defined purely by FirstPowerDate: scheduledBuildMw = capacity
-        // coming online in this year. Cap schedule:
+        // Base year (offset 0): cap = UC scheduled-build MW only (committed; no optimizer adds).
         //
-        //   Base year + first two build years (offset 0-2): cap = committed builds only
-        //     (scheduledBuildMw = "under construction"). The optimizer adds nothing beyond what is
-        //     already scheduled to come online those years.
+        // Years 1-3 (offset 1-3): cap = min(IA pipeline MW, 1.2 × max historic annual addition).
+        //   UC is already in staticBaseCapacity — it is NOT included in the optimizer cap.
+        //   The 1.2× historic factor prevents unrealistic single-year build rates
+        //   (e.g. CAISO can't build 8 GW of batteries if it has never exceeded 3 GW/yr).
+        //   Historic max is measured from 2010–2025 using FirstPowerDate in the installed capacity file.
         //
-        //   Year 3+ (offset ≥ 3) or single-year mode: percentage-of-installed cap from the assumptions
-        //     file (calculateEffectiveAnnualCap), bounded by 1.2 × max historic annual addition.
-        //     The 1.2× historic factor prevents unrealistic single-year build rates; historic max is
-        //     measured from 2010→selectedYear using FirstPowerDate in the installed capacity file.
+        // Years 4+ (offset ≥ 4) or single-year mode: percentage-based cap from assumptions file,
+        //   also bounded by 1.5 × max historic annual addition.
         function getAnnCapForYear(year, techId, baseCapacity, scheduledBuildMw) {
             const techDef = generationTypes.find(t => t.id === techId);
             if (techDef && techDef.retireOnly) return 0;
@@ -717,14 +693,15 @@
 
             if (multiYearBaseYear !== null) {
                 const offset = parseInt(year) - multiYearBaseYear;
-                // Base year + first two build years: committed builds only. With no IA/UC status in
-                // this data source, "under construction" = projects coming online that year.
-                if (offset >= 0 && offset <= 2) {
+                if (offset === 0) {
                     return scheduledBuildMw || 0;
                 }
+                if (offset >= 1 && offset <= 3) {
+                    const yearCaps = pipelineCapByYearAndTech[String(year)];
+                    const pipelineCap = (yearCaps && yearCaps[techId]) || 0;
+                    return isFinite(historicCap) ? Math.min(pipelineCap, historicCap) : pipelineCap;
+                }
             }
-            // Year 3+ (and single-year mode): percentage-of-installed logic, brought forward from
-            // year 4 to start at year 3.
             const percentageCap = calculateEffectiveAnnualCap(baseCapacity, techId, scheduledBuildMw);
             return isFinite(historicCap) ? Math.min(percentageCap, historicCap) : percentageCap;
         }
@@ -733,15 +710,6 @@
         // Main hourly data array - always uses 0-based indexing (0-8759) internally
         // Index 0 = Hour 1 in CSV exports, Index 8759 = Hour 8760 in CSV exports
         let hourlyData = [], dispatchAssets = [];
-        // --- Hourly technology derating (outage) state ---
-        // outageFactors: { COL: Float64Array(8760) } where COL is an outage CSV column and the
-        // stored value is the AVAILABILITY factor (1 - outageRate), clamped to [0,1]. null when no file loaded.
-        // deratingEnabled: UI toggle. Derating is only applied when BOTH the toggle is on AND data is present.
-        let outageFactors = null;
-        let deratingEnabled = false;
-        // Separate opt-in: derive per-tech EFORd (capacity accreditation / ELCC) from the outage file,
-        // LOLP-weighted. Independent of deratingEnabled. Default OFF so accreditation stays reproducible.
-        let efordFromOutage = false;
         let rawLoadData = null;
         let rawGenData = null;
         let dispatchChart = null, monthlyMixChart = null, diurnalMixChart = null, dispatchCurveChart = null, multiYearCapacityChart = null, multiYearMetricsChart = null, annualCapacityAddsChart = null, multiYearElccChart = null, multiYearIrrChart = null, capMarketChart = null, recMarketChart = null;
@@ -766,9 +734,7 @@
         let multiYearBaseYear = null; // first year of the current multi-year run; null in single-year mode or when no run is active
         let currentTaxCredits = {}; // { techId: { type: 'ITC'|'PTC'|'None', itcPercent: 0, ptcPerMWh: 0 } } - stores current tax credit settings per technology
         const DEFAULT_TAX_CREDIT = { type: 'None', itcPercent: 0, ptcPerMWh: 0 }; // Default tax credit when not specified
-        // Legacy single-year: { multiYear:false, zoneAverages:{ZONE:avg}, dailyPrices:[{DayOfYear,ZONE:price}], zoneColumns:[] }
-        // Multi-year forecast: { multiYear:true, years:[...], zoneColumns:[...], byYear:{ [year]: {zoneAverages, dailyPrices, zoneColumns} } }
-        let dailyGasPricesData = null;
+        let dailyGasPricesData = null; // { zoneAverages: { ZONE_NAME: avgPrice, ... }, dailyPrices: [ {DayOfYear, ZONE1: price, ZONE2: price, ...}, ... ] }
         let lastSelectedIso = null; // Track the previously selected ISO to detect ISO changes
         let userElccOverrides = {}; // { techId: elccPercentage } - tracks user-overridden ELCC values as percentages (0-100), not dynamically calculated
         let csvHardcodedElcc = {}; // { techId: elccPercentage (0-100) } - hardcoded ELCC values from CSV input file, used when CSV column has a value
@@ -2269,73 +2235,9 @@
         // --- Math Utils ---
         // Helper function to check if a technology is thermal or storage (already counted in dispatch capacity)
         function isThermalOrStorage(techId) {
-            return techId === 'coal' || techId === 'oil' || techId === 'other' ||
-                   techId === 'existing-gas' || techId === 'new-gas-ccgt' || techId === 'new-gas-ct' ||
+            return techId === 'coal' || techId === 'oil' || techId === 'other' || 
+                   techId === 'existing-gas' || techId === 'new-gas-ccgt' || techId === 'new-gas-ct' || 
                    techId === 'storage';
-        }
-
-        // --- Hourly derating mapping & helpers ---
-        // Maps a merit-stack Asset_Type to its outage CSV column. Existing gas uses the CC_GAS
-        // series as a proxy (dominant fleet type); IC_GAS / ST_GAS are unused under this proxy.
-        const ASSET_TYPE_TO_OUTAGE_COL = {
-            'Coal': 'COAL',
-            'Oil': 'OIL',
-            'Other': 'ST_OTHER',
-            'Gas': 'CC_GAS',
-            'Natural Gas': 'CC_GAS',
-            'Existing Gas': 'CC_GAS',
-            'New Gas CCGT': 'CC_GAS',
-            'New Gas CT': 'CT_GAS'
-        };
-        // generationTypes tech id -> outage CSV column. Among firm/renewables only nuclear is derated
-        // (wind/solar/hydro/biomass/geothermal have no outage columns). The thermal ids are included so
-        // the reported Peak Reserve Margin metric can derate per-tech installed capacity; they are never
-        // reached by the firm/renewable net-load loop (which returns early for thermal ids).
-        const TECH_ID_TO_OUTAGE_COL = {
-            'nuclear': 'NUCLEAR',
-            'coal': 'COAL',
-            'oil': 'OIL',
-            'other': 'ST_OTHER',
-            'existing-gas': 'CC_GAS',
-            'new-gas-ccgt': 'CC_GAS',
-            'new-gas-ct': 'CT_GAS'
-        };
-        const OUTAGE_COLS = ['CC_GAS','COAL','CT_GAS','IC_GAS','NUCLEAR','OIL','ST_GAS','ST_OTHER'];
-
-        // True only when the toggle is on AND outage data is loaded. When false, every code path
-        // below is byte-for-byte identical to the pre-derating behavior.
-        function isDeratingActive() {
-            return deratingEnabled && outageFactors !== null;
-        }
-        // Availability factor (1 - outage) for an outage column at an hour; 1 when derating is off,
-        // data is missing, or the column is unmapped (i.e. no derating for that resource).
-        function getAvailabilityFactor(col, hourIdx) {
-            if (!isDeratingActive() || !col) return 1;
-            const arr = outageFactors[col];
-            return arr ? arr[hourIdx] : 1;
-        }
-        // True when EFORd should be derived from the outage file (accreditation only; separate opt-in).
-        function isEfordDerivationActive() {
-            return efordFromOutage && outageFactors !== null;
-        }
-        // LOLP-weighted EFORd per tech id from the outage file:
-        //   EFORd(tech) = 1 - ( Σ_h availability_col(h) * LOLP(h) ) / Σ_h LOLP(h)
-        // Weighting by LOLP concentrates on reliability-stress (peak) hours, approximating a forced-only
-        // rate since planned maintenance is scheduled off-peak. Only returns entries for tech ids mapped
-        // to an outage column; callers fall back to NERC_FORCED_OUTAGE_RATES for the rest.
-        function deriveEfordFromOutage(lolpByHour, lolpTotal) {
-            const out = {};
-            if (!outageFactors || !(lolpTotal > 0)) return out;
-            for (const techId in TECH_ID_TO_OUTAGE_COL) {
-                const col = TECH_ID_TO_OUTAGE_COL[techId];
-                const arr = outageFactors[col];
-                if (!arr) continue;
-                let wAvail = 0;
-                for (let h = 0; h < 8760; h++) wAvail += arr[h] * lolpByHour[h];
-                wAvail /= lolpTotal;
-                out[techId] = Math.max(0, Math.min(1, 1 - wAvail));
-            }
-            return out;
         }
         
         class SeededRNG {
@@ -2460,72 +2362,18 @@
         // Returns a scalar to multiply with the annual gas price from market assumptions
         // The scaling is: (daily_price_for_zone / annual_avg_for_zone)
         // This makes the average gas price over the year equal to the market assumptions value
-        // Resolve the single-year gas slice {zoneAverages, dailyPrices, zoneColumns} for a given year.
-        // Legacy single-year files ignore the year. Multi-year files clamp to the nearest available year,
-        // so runs outside the forecast horizon still receive a price shape. Returns null when unavailable.
-        function getGasSliceForYear(year) {
-            if (!dailyGasPricesData) return null;
-            if (!dailyGasPricesData.multiYear) return dailyGasPricesData; // legacy single-year slice
-            const years = dailyGasPricesData.years;
-            if (!years || years.length === 0) return null;
-            let y = parseInt(year);
-            if (isNaN(y)) y = years[0];
-            if (y < years[0]) y = years[0];
-            else if (y > years[years.length - 1]) y = years[years.length - 1];
-            if (dailyGasPricesData.byYear[y]) return dailyGasPricesData.byYear[y];
-            // Nearest available year (handles any gaps in the forecast).
-            let best = years[0], bestD = Infinity;
-            for (const yy of years) { const d = Math.abs(yy - y); if (d < bestD) { bestD = d; best = yy; } }
-            return dailyGasPricesData.byYear[best] || null;
-        }
-
-        // Resolve the gas zone column for an ISO+zone within a slice's zoneColumns, mirroring the matching
-        // used by getDailyGasPriceScalar (exact ISO_ZONE, then normalized ISO+zone, then first ISO match).
-        function resolveGasZoneColumn(slice, iso, zone) {
-            if (!slice || !slice.zoneColumns) return null;
-            if (zone) {
-                const exact = `${iso}_${zone}`;
-                if (slice.zoneColumns.includes(exact)) return exact;
-                const norm = slice.zoneColumns.find(c => {
-                    const parts = c.split('_');
-                    return isoNamesMatch(parts[0], iso) && parts.slice(1).join('_') === zone;
-                });
-                if (norm) return norm;
-            }
-            if (iso) {
-                const isoMatch = slice.zoneColumns.find(c => isoNamesMatch(c.split('_')[0], iso));
-                if (isoMatch) return isoMatch;
-            }
-            return null;
-        }
-
-        // Default annual gas level ($/MMBtu) from the loaded gas file for a year+ISO+zone, or null.
-        // Used as the fallback level when the market-assumptions file supplies no Gas Price.
-        function getGasDefaultForYearZone(year, iso, zone) {
-            const slice = getGasSliceForYear(year);
-            if (!slice) return null;
-            const col = resolveGasZoneColumn(slice, iso, zone);
-            if (!col) return null;
-            const avg = slice.zoneAverages[col];
-            return (avg && avg > 0) ? avg : null;
-        }
-
         function getDailyGasPriceScalar(hourIdx) {
             if (!dailyGasPricesData) return 1.0; // No daily gas prices uploaded, use uniform price
-
-            // Resolve the slice for the current simulation year (multi-year files); legacy files ignore year.
-            const slice = getGasSliceForYear(document.getElementById('yearSelector')?.value);
-            if (!slice) return 1.0;
-
+            
             // Get the zone column name based on selected zone
             let zoneColumn = null;
             if (selectedZone) {
                 // The zone column format is ISO_ZONE (e.g., "CAISO_NP15", "ERCOT_COAST")
                 zoneColumn = `${selectedZone.iso}_${selectedZone.zone}`;
                 // Check if this exact column exists
-                if (!slice.zoneColumns.includes(zoneColumn)) {
+                if (!dailyGasPricesData.zoneColumns.includes(zoneColumn)) {
                     // Try to find a matching zone using normalized ISO name
-                    zoneColumn = slice.zoneColumns.find(col => {
+                    zoneColumn = dailyGasPricesData.zoneColumns.find(col => {
                         const parts = col.split('_');
                         const colIso = parts[0];
                         const colZone = parts.slice(1).join('_');
@@ -2538,7 +2386,7 @@
             if (!zoneColumn) {
                 const currentIso = document.getElementById('isoSelector')?.value;
                 if (currentIso) {
-                    zoneColumn = slice.zoneColumns.find(col => {
+                    zoneColumn = dailyGasPricesData.zoneColumns.find(col => {
                         const parts = col.split('_');
                         const colIso = parts[0];
                         return isoNamesMatch(colIso, currentIso);
@@ -2559,11 +2407,11 @@
             const clampedDayIndex = Math.min(364, Math.max(0, dayIndex));
             
             // Get the daily price for this zone and day
-            const dailyRow = slice.dailyPrices[clampedDayIndex];
+            const dailyRow = dailyGasPricesData.dailyPrices[clampedDayIndex];
             if (!dailyRow) return 1.0;
-
+            
             const dailyPrice = parseFloat(dailyRow[zoneColumn]) || 0;
-            const zoneAverage = slice.zoneAverages[zoneColumn] || 0;
+            const zoneAverage = dailyGasPricesData.zoneAverages[zoneColumn] || 0;
             
             // Return the scaling factor: daily_price / annual_average
             // If average is 0 or daily price is 0, return 1.0 (no scaling)
@@ -4292,7 +4140,6 @@
                             else if (fileHeaders.includes('ISO') && fileHeaders.includes('Year') && fileHeaders.includes('Capex ($/kW)')) fileType = 'assumptions';
                             else if (fileHeaders.includes('ENVProjectID') && fileHeaders.includes('ProjectName') && fileHeaders.includes('ISOTerritory')) fileType = 'project_db';
                             else if (fileHeaders.includes('DayOfYear') && fileHeaders.some(h => /^[A-Z]+_[A-Z0-9]+$/.test(h))) fileType = 'daily_gas_prices';
-                            else if (fileHeaders.includes('hour_of_year') && fileHeaders.includes('CC_GAS') && fileHeaders.includes('COAL')) fileType = 'outages';
                         }
                         
                         // Accumulate row data
@@ -4315,7 +4162,6 @@
                             if (fileType === 'assumptions') processMarketAssumptionsData(accumulatedData, fileHeaders);
                             if (fileType === 'project_db') processProjectDbData(accumulatedData, fileHeaders);
                             if (fileType === 'daily_gas_prices') await processDailyGasPricesData(accumulatedData, fileHeaders);
-                            if (fileType === 'outages') processOutageData(accumulatedData, fileHeaders);
                         } else {
                             addFeedback(file.name, 'Unknown CSV headers', false);
                         }
@@ -4412,93 +4258,10 @@
                     Capacity_MW: parseFloat(row.Capacity_MW),
                     Heat_Rate: parseFloat(row.Heat_Rate)
                 }));
-                updateThermalSliders();
+                updateThermalSliders(); 
                 checkEnableButtons();
             } else {
                 showNotification('Invalid Dispatch CSV', true);
-            }
-        }
-
-        // Parse the hourly outage file into availability factors (1 - outageRate) per technology column.
-        // On success, derating is auto-enabled (toggle checked) and the model re-runs. Invalid/short files
-        // fail safe: derating is disabled and behavior reverts to nameplate.
-        function processOutageData(data, fields) {
-            if (!fields.includes('hour_of_year') || !OUTAGE_COLS.every(c => fields.includes(c))) {
-                showNotification('Invalid Outages CSV (need hour_of_year + all technology columns)', true);
-                return;
-            }
-            if (data.length !== 8760) {
-                showNotification(`Outages CSV must have 8760 rows (got ${data.length}). Derating disabled.`, true);
-                outageFactors = null;
-                deratingEnabled = false;
-                efordFromOutage = false;
-                const t = document.getElementById('derating-toggle'); if (t) t.checked = false;
-                const et = document.getElementById('eford-derive-toggle'); if (et) et.checked = false;
-                updateDeratingStatusUI();
-                return;
-            }
-            const factors = {};
-            OUTAGE_COLS.forEach(c => factors[c] = new Float64Array(8760));
-            let filled = 0;
-            data.forEach(row => {
-                const hoy = parseInt(row.hour_of_year, 10);
-                if (!(hoy >= 1 && hoy <= 8760)) return;
-                const idx = hoy - 1;
-                OUTAGE_COLS.forEach(c => {
-                    const rate = parseFloat(row[c]);
-                    // Availability = 1 - outage rate; clamp to [0,1] to guard against malformed inputs.
-                    factors[c][idx] = isNaN(rate) ? 1 : Math.max(0, Math.min(1, 1 - rate));
-                });
-                filled++;
-            });
-            if (filled !== 8760) {
-                showNotification(`Outages CSV has non-contiguous hour_of_year (mapped ${filled}/8760). Derating disabled.`, true);
-                outageFactors = null;
-                deratingEnabled = false;
-                efordFromOutage = false;
-                const t = document.getElementById('derating-toggle'); if (t) t.checked = false;
-                const et = document.getElementById('eford-derive-toggle'); if (et) et.checked = false;
-                updateDeratingStatusUI();
-                return;
-            }
-            outageFactors = factors;
-            // Auto-enable on successful load; user can toggle off afterward.
-            deratingEnabled = true;
-            const toggle = document.getElementById('derating-toggle');
-            if (toggle) toggle.checked = true;
-            updateDeratingStatusUI();
-            if (hourlyData.length > 0 && dispatchAssets.length > 0) runModel();
-        }
-
-        function handleOutageUpload(e) {
-            const accumulatedData = [];
-            let fields = null;
-            Papa.parse(e.target.files[0], {
-                header: true,
-                dynamicTyping: false,
-                skipEmptyLines: true,
-                worker: false,
-                step: (row) => {
-                    if (!fields && row.meta && row.meta.fields) fields = row.meta.fields;
-                    if (row.data) accumulatedData.push(row.data);
-                },
-                complete: () => processOutageData(accumulatedData, fields)
-            });
-        }
-
-        // Reflect current outage/derating state in the small status line under the toggle.
-        function updateDeratingStatusUI() {
-            const el = document.getElementById('derating-status');
-            if (!el) return;
-            if (!outageFactors) {
-                el.textContent = 'No outage file loaded';
-                el.className = 'text-[9px] text-prism-muted/60 mt-1';
-            } else if (deratingEnabled) {
-                el.textContent = 'Derating ACTIVE (8760 hrs loaded)';
-                el.className = 'text-[9px] text-prism-green mt-1';
-            } else {
-                el.textContent = 'Outage file loaded — derating OFF';
-                el.className = 'text-[9px] text-amber-400 mt-1';
             }
         }
 
@@ -4537,60 +4300,44 @@
                 showNotification('Invalid Daily Gas Prices CSV: missing DayOfYear column', true);
                 return;
             }
-
-            // A 'year' column marks the compact MULTI-YEAR forecast; single-year files lack it.
-            const isMultiYear = fields.includes('year');
-
-            // Zone columns = every column except the index columns.
-            const zoneColumns = fields.filter(h => h !== 'DayOfYear' && h !== 'year');
+            
+            // Get zone columns (all columns except DayOfYear)
+            const zoneColumns = fields.filter(h => h !== 'DayOfYear');
             if (zoneColumns.length === 0) {
                 showNotification('Invalid Daily Gas Prices CSV: no zone columns found', true);
                 return;
             }
-
-            // Build one single-year slice {zoneAverages, dailyPrices (<=365, sorted by DayOfYear), zoneColumns}
-            // from a set of daily rows. Averages exclude non-positive prices. This is the same shape the
-            // downstream scalar logic already consumes — so nothing after this point needs to change.
-            const buildSlice = (rows) => {
-                const sorted = rows.slice()
-                    .sort((a, b) => (parseInt(a.DayOfYear) || 0) - (parseInt(b.DayOfYear) || 0))
-                    .slice(0, 365);
-                const zoneAverages = {};
-                zoneColumns.forEach(zone => {
-                    const valid = sorted.map(r => parseFloat(r[zone])).filter(p => p > 0);
-                    zoneAverages[zone] = valid.length ? valid.reduce((s, p) => s + p, 0) / valid.length : 0;
-                });
-                return { zoneAverages, dailyPrices: sorted, zoneColumns };
-            };
-
-            if (isMultiYear) {
-                // Group rows by year, then build a per-year slice. Stored as a year-nested structure;
-                // getGasSliceForYear() resolves the right slice at run time (with nearest-year clamping).
-                const grouped = {};
-                data.forEach(row => {
-                    const y = parseInt(row.year);
-                    if (isNaN(y)) return;
-                    (grouped[y] = grouped[y] || []).push(row);
-                });
-                const years = Object.keys(grouped).map(Number).sort((a, b) => a - b);
-                if (years.length === 0) {
-                    showNotification('Invalid multi-year gas file: no valid year values', true);
-                    return;
-                }
-                const byYear = {};
-                years.forEach(y => { byYear[y] = buildSlice(grouped[y]); });
-                dailyGasPricesData = { multiYear: true, byYear, years, zoneColumns };
-                showNotification(`Loaded multi-year gas prices: ${years.length} years (${years[0]}–${years[years.length - 1]}), ${zoneColumns.length} zones`);
-            } else {
-                // Legacy single-year file (unchanged behavior).
-                if (data.length < 365) {
-                    showNotification(`Daily Gas Prices has ${data.length} rows, expected at least 365`, true);
-                    return;
-                }
-                dailyGasPricesData = { multiYear: false, ...buildSlice(data) };
-                showNotification(`Loaded daily gas prices for ${zoneColumns.length} zones`);
+            
+            // Verify we have at least 365 rows (accepts 366 for leap years)
+            if (data.length < 365) {
+                showNotification(`Daily Gas Prices has ${data.length} rows, expected at least 365`, true);
+                return;
             }
-
+            
+            // Use 365 days for simulation (standard year)
+            const numDays = 365;
+            
+            // Calculate zone averages (average of all daily prices for each zone)
+            const zoneAverages = {};
+            zoneColumns.forEach(zone => {
+                const prices = data.slice(0, numDays).map(row => parseFloat(row[zone]) || 0);
+                const validPrices = prices.filter(p => p > 0);
+                if (validPrices.length > 0) {
+                    zoneAverages[zone] = validPrices.reduce((sum, p) => sum + p, 0) / validPrices.length;
+                } else {
+                    zoneAverages[zone] = 0;
+                }
+            });
+            
+            // Store the data (use first 365 days regardless of whether there are 366)
+            dailyGasPricesData = {
+                zoneAverages: zoneAverages,
+                dailyPrices: data.slice(0, numDays),
+                zoneColumns: zoneColumns
+            };
+            
+            showNotification(`Loaded daily gas prices for ${zoneColumns.length} zones`);
+            
             // Re-run model if data is ready
             if (hourlyData.length > 0 && dispatchAssets.length > 0) await runModel();
         }
@@ -5817,15 +5564,7 @@
             // 1. Update Market Inputs
             const setVal = (id, val) => { const el = document.getElementById(id); if(el) el.value = val; };
             
-            // Gas price level: (1) market-assumptions Gas Price if provided, else (2) the year+zone
-            // average from the loaded gas file, else (3) 3.5. The daily shape (scalar) is applied on top
-            // regardless; when the level equals the year/zone average, the merit order runs on the raw
-            // forecast daily prices. Uses matchedIso (the ISO that matched assumptions) + the selected zone.
-            const _gasAssumption = m['Gas Price ($/Mmbtu)'];
-            const _gasHasAssumption = _gasAssumption !== undefined && _gasAssumption !== null
-                && _gasAssumption !== '' && !isNaN(parseFloat(_gasAssumption));
-            const _gasFileDefault = getGasDefaultForYearZone(year, matchedIso, selectedZone?.zone);
-            setVal('gas-fuel-cost', _gasHasAssumption ? _gasAssumption : (_gasFileDefault ?? 3.5));
+            setVal('gas-fuel-cost', m['Gas Price ($/Mmbtu)'] ?? 3.5);
             setVal('coal-fuel-cost', m['Coal Price ($/Mmbtu)'] ?? 2.0);
             setVal('oil-fuel-cost', m['Oil Price ($/Mmbtu)'] ?? 15.0);
             setVal('carbon-cost', m['Carbon Cost ($/ton)'] ?? 0);
@@ -7112,26 +6851,6 @@
             document.getElementById('historicalFile').addEventListener('change', handleHistoricalUpload);
             document.getElementById('assumptionsFile').addEventListener('change', handleMarketAssumptionsUpload);
             document.getElementById('dailyGasPricesFile').addEventListener('change', handleDailyGasPricesUpload);
-            document.getElementById('outageFile').addEventListener('change', handleOutageUpload);
-            document.getElementById('derating-toggle').addEventListener('change', async (e) => {
-                // Toggle only takes effect when an outage file is loaded.
-                deratingEnabled = e.target.checked && outageFactors !== null;
-                if (e.target.checked && outageFactors === null) {
-                    e.target.checked = false;
-                    showNotification('Load an hourly outage file before enabling derating.', true);
-                }
-                updateDeratingStatusUI();
-                if (hourlyData.length > 0 && dispatchAssets.length > 0) await runModel();
-            });
-            document.getElementById('eford-derive-toggle').addEventListener('change', async (e) => {
-                // Accreditation-only opt-in; requires an outage file to be loaded.
-                efordFromOutage = e.target.checked && outageFactors !== null;
-                if (e.target.checked && outageFactors === null) {
-                    e.target.checked = false;
-                    showNotification('Load an hourly outage file before deriving EFORd.', true);
-                }
-                if (hourlyData.length > 0 && dispatchAssets.length > 0) await runModel();
-            });
             document.getElementById('optimizeButton').addEventListener('click', runOptimizer);
             document.getElementById('optimizeAllYearsButton').addEventListener('click', optimizeAllYears);
             document.getElementById('runAllIsosButton').addEventListener('click', runAllIsosAndYears);
@@ -7867,17 +7586,12 @@
             
             // Storage capacity is added to available generation at full nameplate
             const storageCapacity = installedCapacities['storage'] || 0;
-
-            // When derating is active, use the hourly-derated thermal capacity produced by runCoreModel
-            // (nuclear is already reflected in the variable-gen term below via its derated hourlyGeneration).
-            const useHourlyDerate = coreResults.deratingActive && coreResults.hourlyDeratedThermalCapacity;
-
+            
             for (let h = 0; h < 8760; h++) {
                 const loadMW = hourlyData[h] ? hourlyData[h].Load_MW : 0;
-
+                
                 // Available generation = thermal dispatchable + storage capacity + renewable/firm hourly generation
-                const thermalCapH = useHourlyDerate ? coreResults.hourlyDeratedThermalCapacity[h] : totalThermalDispatchCapacity;
-                let availableGenAtHour = thermalCapH + storageCapacity;
+                let availableGenAtHour = totalThermalDispatchCapacity + storageCapacity;
                 
                 generationTypes.forEach(tech => {
                     if (tech.type === 'renewable' || tech.type === 'firm') {
@@ -8282,55 +7996,32 @@
             const netLoad = modelResults.netLoad;
             const thermalIds = new Set(['coal', 'oil', 'other', 'existing-gas', 'new-gas-ccgt', 'new-gas-ct']);
             const firmIds   = new Set([...thermalIds, 'nuclear']);
+            let fleetMu = 0, fleetVar = 0;
+            generationTypes.forEach(tech => {
+                if (!firmIds.has(tech.id)) return;
+                const s = document.getElementById(`${tech.id}-slider`);
+                const cap = Math.max(0, (s ? (parseInt(s.value) || 0) : 0) || installedCapacities[tech.id] || 0);
+                if (cap <= 0) return;
+                const f = NERC_FORCED_OUTAGE_RATES[tech.id] || 0.08;
+                fleetMu  += cap * (1 - f);
+                fleetVar += cap * cap * f * (1 - f);
+            });
+            const fleetSigma = Math.sqrt(fleetVar);
             const normCDF = x => {
                 const t = 1 / (1 + 0.2316419 * Math.abs(x));
                 const p = t * (0.319381530 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))));
                 const cdf = 1 - (Math.exp(-0.5 * x * x) / Math.sqrt(2 * Math.PI)) * p;
                 return x >= 0 ? cdf : 1 - cdf;
             };
-            // Fleet firm-capacity normal approximation + hourly LOLP, parameterized by an EFORd accessor
-            // so it can be evaluated with either the hardcoded NERC rates or file-derived rates.
-            const computeFleetLolp = (efordFn) => {
-                let mu = 0, varr = 0;
-                generationTypes.forEach(tech => {
-                    if (!firmIds.has(tech.id)) return;
-                    const s = document.getElementById(`${tech.id}-slider`);
-                    const cap = Math.max(0, (s ? (parseInt(s.value) || 0) : 0) || installedCapacities[tech.id] || 0);
-                    if (cap <= 0) return;
-                    const f = efordFn(tech.id);
-                    mu   += cap * (1 - f);
-                    varr += cap * cap * f * (1 - f);
-                });
-                const sigma = Math.sqrt(varr);
-                const lbh = new Float64Array(8760);
-                let lt = 0;
-                for (let h = 0; h < 8760; h++) {
-                    const lolp = sigma > 0
-                        ? normCDF(((netLoad[h] || 0) - mu) / sigma)
-                        : ((netLoad[h] || 0) > mu ? 1 : 0);
-                    lbh[h] = lolp; lt += lolp;
-                }
-                return { lolpByHour: lbh, lolpTotal: lt };
-            };
-            const nercEford = (id) => NERC_FORCED_OUTAGE_RATES[id] ?? 0.08;
-            // Pass 1: baseline LOLP from hardcoded EFORd. The set of tight hours is driven by net-load
-            // shape and is robust to modest EFORd changes, so it is safe to use for weighting.
-            let { lolpByHour, lolpTotal } = computeFleetLolp(nercEford);
-            // Optional (opt-in): derive per-tech EFORd from the outage file, LOLP-weighted, then refine
-            // the LOLP once so the tight hours are self-consistent with the forced rates actually used.
-            // Techs absent from the file (hydro/biomass/geothermal) keep their NERC values.
-            let derivedEford = {};
-            const efordDerivationActive = isEfordDerivationActive();
-            if (efordDerivationActive) {
-                derivedEford = deriveEfordFromOutage(lolpByHour, lolpTotal);
-                const refined = computeFleetLolp(id => (derivedEford[id] !== undefined ? derivedEford[id] : nercEford(id)));
-                lolpByHour = refined.lolpByHour;
-                lolpTotal = refined.lolpTotal;
-                console.log('[ELCC] EFORd derived from outage file (LOLP-weighted):',
-                    Object.fromEntries(Object.entries(derivedEford).map(([k, v]) => [k, +v.toFixed(4)])));
+            let lolpTotal = 0;
+            const lolpByHour = new Float64Array(8760);
+            for (let h = 0; h < 8760; h++) {
+                const lolp = fleetSigma > 0
+                    ? normCDF(((netLoad[h] || 0) - fleetMu) / fleetSigma)
+                    : ((netLoad[h] || 0) > fleetMu ? 1 : 0);
+                lolpByHour[h] = lolp;
+                lolpTotal += lolp;
             }
-            // Effective EFORd used by the ELCC credit and the new-entrant proxy below.
-            const effEford = (id) => (efordDerivationActive && derivedEford[id] !== undefined) ? derivedEford[id] : nercEford(id);
 
             const elccValues = {};
             const genKeyMap = {
@@ -8363,7 +8054,7 @@
                 if (!DISPATCH_BASED_ELCC_IDS.has(tech.id)) {
                     // Availability-based ELCC: thermal, hydro, biomass, geothermal, nuclear.
                     // These are dispatchable on demand — credit = installedCap × (1 − EFORd).
-                    const eford = effEford(tech.id);
+                    const eford = NERC_FORCED_OUTAGE_RATES[tech.id] ?? 0.08;
                     weightedGen = installedCap * (1 - eford) * lolpTotal;
                 } else if (genArray) {
                     // Dispatch-based ELCC: solar, wind, storage.
@@ -8482,7 +8173,7 @@
                 let elcc = elccValues[tech.id] || 0;
                 if (elcc <= 0 && canBuildNew && lolpTotal > 0) {
                     if (!DISPATCH_BASED_ELCC_IDS.has(tech.id)) {
-                        elcc = 1 - effEford(tech.id);
+                        elcc = 1 - (NERC_FORCED_OUTAGE_RATES[tech.id] ?? 0.08);
                     } else {
                         const cfArr = buildProxyCF(tech.name);
                         let wSum = 0;
@@ -8718,11 +8409,9 @@
                         const storageGen = modelResults.hourlyGeneration['Storage'] ? modelResults.hourlyGeneration['Storage'][peakLoadHour] : 0;
                         actualDispatchAtPeak += Math.max(0, storageGen);
                     } else {
-                        // For thermal resources, available capacity is the installed capacity.
-                        // When hourly derating is active, reduce it by this tech's outage rate at the peak hour
-                        // (getAvailabilityFactor returns 1 when derating is off, preserving prior behavior).
+                        // For thermal resources, available capacity is the installed capacity
                         const installedCap = installedCapacities[tech.id] || 0;
-                        availableDispatchableAtPeak += installedCap * getAvailabilityFactor(TECH_ID_TO_OUTAGE_COL[tech.id], peakLoadHour);
+                        availableDispatchableAtPeak += installedCap;
                         
                         // Get actual dispatch from hourlyGeneration using the correct key
                         let genKey;
@@ -8777,11 +8466,8 @@
                 if (tech.type === 'renewable' || tech.type === 'firm') {
                      if (tech.id === 'coal' || tech.id === 'oil' || tech.id === 'other' || tech.id === 'existing-gas' || tech.id === 'new-gas-ccgt' || tech.id === 'new-gas-ct' || tech.id === 'storage' || tech.id === 'imports') return; 
                      const capacity = installedCapacities[tech.id] || 0;
-                     // Only nuclear is derated among firm/renewables (others have no outage column).
-                     const firmOutageCol = TECH_ID_TO_OUTAGE_COL[tech.id];
                      for(let i=0; i<8760; i++) {
                          let gen = tech.header && hourlyData[i][tech.header] !== undefined ? capacity * hourlyData[i][tech.header] : capacity;
-                         if (firmOutageCol) gen *= getAvailabilityFactor(firmOutageCol, i);
                          hourlyGeneration[tech.name][i] = gen; baseNetLoad[i] -= gen;
                      }
                 }
@@ -8970,66 +8656,6 @@
             const scarcityThreshold = totalDispatchableCapacity * 0.95;
             let scarcityStartCost = fullDispatchStack.length ? fullDispatchStack[fullDispatchStack.length - 1].cost : 0;
             const scarcityCapacity = totalDispatchableCapacity - scarcityThreshold;
-
-            // ===== HOURLY DERATING SETUP =====
-            // When active, each asset's available capacity varies by hour via its technology's outage
-            // series. The merit ORDER never changes (derating only scales each step's height), so we keep
-            // fullDispatchStack sorted and its nameplate Capacity_MW intact (downstream reserve-margin/
-            // chart/ELCC reuse it). We decompose the hourly cumulative capacity as:
-            //   cumAt(k,h) = prefixNoDerate[k] + Σ_c prefixByCol[c][k] * availability[c][h]
-            // which keeps per-hour lookups O(numUsedCols) instead of O(assets), avoiding an
-            // O(assets×8760) recompute. When derating is off, everything falls back to the static arrays.
-            const deratingActive = isDeratingActive();
-            const stackLen = fullDispatchStack.length;
-            // Per-asset availability array (the Float64Array for its outage column, or null = always available).
-            const assetOutageArr = new Array(stackLen).fill(null);
-            const usedCols = [];
-            const colIndexOf = {};
-            if (deratingActive) {
-                for (let i = 0; i < stackLen; i++) {
-                    const col = ASSET_TYPE_TO_OUTAGE_COL[fullDispatchStack[i].Asset_Type];
-                    if (col && outageFactors[col]) {
-                        assetOutageArr[i] = outageFactors[col];
-                        if (colIndexOf[col] === undefined) { colIndexOf[col] = usedCols.length; usedCols.push(outageFactors[col]); }
-                    }
-                }
-            }
-            const numUsedCols = usedCols.length;
-            // prefixByCol[c][k] = cumulative NAMEPLATE capacity of assets[0..k] mapped to used-column c.
-            // prefixNoDerate[k] = cumulative nameplate capacity of assets[0..k] with no outage column.
-            const prefixByCol = [];
-            for (let c = 0; c < numUsedCols; c++) prefixByCol.push(new Float64Array(stackLen));
-            const prefixNoDerate = new Float64Array(stackLen);
-            if (deratingActive) {
-                let noDerAcc = 0;
-                const colAcc = new Float64Array(numUsedCols);
-                for (let k = 0; k < stackLen; k++) {
-                    const col = ASSET_TYPE_TO_OUTAGE_COL[fullDispatchStack[k].Asset_Type];
-                    const ci = (col && colIndexOf[col] !== undefined) ? colIndexOf[col] : -1;
-                    if (ci === -1) noDerAcc += fullDispatchStack[k].Capacity_MW;
-                    else colAcc[ci] += fullDispatchStack[k].Capacity_MW;
-                    prefixNoDerate[k] = noDerAcc;
-                    for (let c = 0; c < numUsedCols; c++) prefixByCol[c][k] = colAcc[c];
-                }
-            }
-            // Cumulative available (derated) capacity through stack index k at hour h. Monotonic in k.
-            const cumAt = (k, h) => {
-                if (k < 0) return 0;
-                if (!deratingActive) return dispatchStackAccumulated[k];
-                let total = prefixNoDerate[k];
-                for (let c = 0; c < numUsedCols; c++) total += prefixByCol[c][k] * usedCols[c][h];
-                return total;
-            };
-            // Total derated dispatchable capacity at hour h (== nameplate total when derating off).
-            const totalCapAt = (h) => deratingActive ? cumAt(stackLen - 1, h) : totalDispatchableCapacity;
-            // Available (derated) MW of a single stack asset at hour h.
-            const availMWAt = (idx, h) => {
-                const arr = assetOutageArr[idx];
-                return arr ? fullDispatchStack[idx].Capacity_MW * arr[h] : fullDispatchStack[idx].Capacity_MW;
-            };
-            // Hourly derated thermal dispatchable capacity, exported for the reserve-margin metric.
-            const hourlyDeratedThermalCapacity = new Float64Array(8760);
-            for (let h = 0; h < 8760; h++) hourlyDeratedThermalCapacity[h] = totalCapAt(h);
             // ERCOT keeps a higher price cap (extreme scarcity events are real in the nodal market);
             // all other ISOs are capped at the global PRICE_CAP.
             const effectivePriceCap = conf.iso === 'ERCOT' ? 5000 : conf.iso === 'CAISO' ? 400 : PRICE_CAP;
@@ -9070,11 +8696,8 @@
                 
                 // Available generation = thermal dispatchable + storage capacity + pre-calculated variable generation
                 // Using totalVariableGen[hourIdx] eliminates the need to iterate through generationTypes,
-                // significantly improving performance in this hot code path.
-                // When derating is active, thermal capacity is the hourly-derated value; totalVariableGen
-                // already reflects derated nuclear (nuclear generation was scaled above).
-                const thermalCapH = deratingActive ? hourlyDeratedThermalCapacity[hourIdx] : totalThermalDispatchCapacity;
-                const availableGenAtHour = thermalCapH + storageCapacity + totalVariableGen[hourIdx];
+                // significantly improving performance in this hot code path
+                const availableGenAtHour = totalThermalDispatchCapacity + storageCapacity + totalVariableGen[hourIdx];
                 
                 // Reserve margin = ((available generation / load) - 1) as decimal
                 return load > 0 ? ((availableGenAtHour / load) - 1) : 0;
@@ -9089,34 +8712,27 @@
                 
                 // Calculate Fundamental Price (from dispatch stack) WITHOUT post-processing
                 let fundamentalPrice = 0;
-
-                // Hourly-derated capacity geometry. When derating is off these equal the static
-                // totalDispatchableCapacity / scarcityThreshold / scarcityCapacity exactly.
-                const totalCapH = deratingActive ? totalCapAt(hourIdx) : totalDispatchableCapacity;
-                const scarcityThresholdH = deratingActive ? totalCapH * 0.95 : scarcityThreshold;
-                const scarcityCapacityH = deratingActive ? (totalCapH - scarcityThresholdH) : scarcityCapacity;
-
+                
                 if (load <= 0 && hourlyData[hourIdx].Load_MW > 0) {
                     fundamentalPrice = -30 * Math.min(1, -load / hourlyData[hourIdx].Load_MW);
                 } else if (load <= 0) {
                     fundamentalPrice = 0;
-                } else if (load > totalCapH) {
+                } else if (load > totalDispatchableCapacity) {
                     fundamentalPrice = effectivePriceCap;
-                } else if (scarcityCapacityH > 0 && load > scarcityThresholdH) {
+                } else if (scarcityCapacity > 0 && load > scarcityThreshold) {
                     // Use hourly gas cost for scarcity start cost (use the last/most expensive asset in the sorted stack)
                     const hourlyScarcityStartCost = fullDispatchStack.length ? getAssetCostForHour(fullDispatchStack[fullDispatchStack.length - 1], hourIdx) : 0;
-                    fundamentalPrice = hourlyScarcityStartCost + (load - scarcityThresholdH) * ((effectivePriceCap - hourlyScarcityStartCost) / scarcityCapacityH);
+                    fundamentalPrice = hourlyScarcityStartCost + (load - scarcityThreshold) * ((effectivePriceCap - hourlyScarcityStartCost) / scarcityCapacity);
                 } else {
                     // --- BINARY SEARCH OPTIMIZATION ---
-                    // Find the first index where the (hourly-derated) cumulative capacity >= load.
-                    // cumAt is monotonic in the index at a fixed hour, so binary search remains valid.
-                    let low = 0, high = stackLen - 1;
+                    // Find the first index where dispatchStackAccumulated[index] >= load
+                    // This replaces the O(n) linear search with O(log n) binary search
+                    let low = 0, high = dispatchStackAccumulated.length - 1;
                     let foundIdx = -1;
 
                     while (low <= high) {
                         const mid = (low + high) >>> 1;
-                        const cum = deratingActive ? cumAt(mid, hourIdx) : dispatchStackAccumulated[mid];
-                        if (cum >= load) {
+                        if (dispatchStackAccumulated[mid] >= load) {
                             foundIdx = mid;
                             high = mid - 1;
                         } else {
@@ -9127,7 +8743,7 @@
                     if (foundIdx !== -1) {
                         fundamentalPrice = getAssetCostForHour(fullDispatchStack[foundIdx], hourIdx);
                     } else {
-                        // Should be covered by load > totalCapH check, but safety fallback
+                        // Should be covered by load > totalDispatchableCapacity check, but safety fallback
                         fundamentalPrice = getAssetCostForHour(fullDispatchStack[0], hourIdx);
                     }
                 }
@@ -9406,30 +9022,25 @@
                 // Calculate price using the fundamental engine (deduplicated logic)
                 let price = calcFundamentalPriceForHour(load, i);
                 
-                // Thermal generation dispatch logic (tracks physical unit dispatch).
-                // Under derating, each unit contributes its hourly-derated available MW; the marginal
-                // unit is found against the same hourly cumulative capacity used for the price.
-                const totalCapDispatchH = deratingActive ? totalCapAt(i) : totalDispatchableCapacity;
+                // Thermal generation dispatch logic (tracks physical unit dispatch)
                 if (load > 0) {
-                    if (load > totalCapDispatchH) {
-                        const hourlyUnserved = load - totalCapDispatchH;
+                    if (load > totalDispatchableCapacity) {
+                        const hourlyUnserved = load - totalDispatchableCapacity;
                         unservedEnergy += hourlyUnserved;
                         if (hourlyUnserved > peakUnservedEnergy) {
                             peakUnservedEnergy = hourlyUnserved;
                         }
-                        for (let idx = 0; idx < stackLen; idx++) {
-                            hourlyGeneration[getGenKey(fullDispatchStack[idx].Asset_Type)][i] += availMWAt(idx, i);
-                        }
+                        fullDispatchStack.forEach(asset => { hourlyGeneration[getGenKey(asset.Asset_Type)][i] += asset.Capacity_MW; });
                     } else {
                         // --- BINARY SEARCH OPTIMIZATION ---
-                        // Find the marginal asset index using binary search on the hourly cumulative capacity.
-                        let low = 0, high = stackLen - 1;
+                        // Find the marginal asset index using binary search on dispatchStackAccumulated
+                        // This replaces the O(n) linear iteration with O(log n) binary search
+                        let low = 0, high = dispatchStackAccumulated.length - 1;
                         let marginalIdx = -1;
 
                         while (low <= high) {
                             const mid = (low + high) >>> 1;
-                            const cum = deratingActive ? cumAt(mid, i) : dispatchStackAccumulated[mid];
-                            if (cum >= load) {
+                            if (dispatchStackAccumulated[mid] >= load) {
                                 marginalIdx = mid;
                                 high = mid - 1;
                             } else {
@@ -9439,14 +9050,14 @@
 
                         // Dispatch all assets up to and including the marginal asset
                         if (marginalIdx !== -1) {
-                            // Dispatch all assets before the marginal one at full (derated) available capacity
+                            // Dispatch all assets before the marginal one at full capacity
                             for (let idx = 0; idx < marginalIdx; idx++) {
-                                hourlyGeneration[getGenKey(fullDispatchStack[idx].Asset_Type)][i] += availMWAt(idx, i);
+                                hourlyGeneration[getGenKey(fullDispatchStack[idx].Asset_Type)][i] += fullDispatchStack[idx].Capacity_MW;
                             }
-
+                            
                             // Dispatch the marginal asset at partial capacity (the remaining load)
-                            const prevAccumulated = marginalIdx > 0 ? (deratingActive ? cumAt(marginalIdx - 1, i) : dispatchStackAccumulated[marginalIdx - 1]) : 0;
-                            const dispatchAmount = Math.min(load - prevAccumulated, availMWAt(marginalIdx, i));
+                            const prevAccumulated = marginalIdx > 0 ? dispatchStackAccumulated[marginalIdx - 1] : 0;
+                            const dispatchAmount = Math.min(load - prevAccumulated, fullDispatchStack[marginalIdx].Capacity_MW);
                             hourlyGeneration[getGenKey(fullDispatchStack[marginalIdx].Asset_Type)][i] += dispatchAmount;
                         }
                     }
@@ -9465,7 +9076,7 @@
             // Note: Planning Reserve Margin (PRM) is calculated separately in calculateMarketMetrics()
             // using ELCC-based accredited capacity instead of actual generation at peak hour.
             // The optimizer and UI use the ELCC-based PRM from marketMetrics.planningReserveMargin.
-            return { unservedEnergy, peakUnservedEnergy, totalCost, hourlyGeneration, hourlyPrices, netLoad: baseNetLoad, netLoadAfterStorage, fullDispatchStack, storagePcharge, storagePdischarge, storagePchargeProcessed, storagePdischargeProcessed, storageSOC, existingGasWeightedHeatRate, hourlyDeratedThermalCapacity, deratingActive };
+            return { unservedEnergy, peakUnservedEnergy, totalCost, hourlyGeneration, hourlyPrices, netLoad: baseNetLoad, netLoadAfterStorage, fullDispatchStack, storagePcharge, storagePdischarge, storagePchargeProcessed, storagePdischargeProcessed, storageSOC, existingGasWeightedHeatRate };
         }
         function getFinancialsWithMetrics(hourlyGeneration, hourlyPrices, installedCapacities, marketMetrics, conf, prevIRRs = {}, existingGasWeightedHeatRate = HEAT_RATE_EXISTING_GAS) {
              const finCalcs = {}; generationTypes.forEach(tech => { finCalcs[tech.id] = { totalRevenue: 0, totalGeneration: 0, totalChargeCost: 0, totalChargeVolume: 0 }; });
@@ -9677,24 +9288,7 @@
         }
         function updateDispatchCurveChart(stack) {
              const ctx = document.getElementById('dispatchCurveChart').getContext('2d'); if (dispatchCurveChart) dispatchCurveChart.destroy();
-
-            // Representative derated curve: when derating is active, scale each asset's capacity by the
-            // annual-average availability (1 - mean outage) for its technology. The hourly dispatch/price
-            // engine uses the true hourly factors; this single supply curve shows a representative snapshot.
-            const deratingOn = isDeratingActive();
-            const repFactorCache = {};
-            const repFactorForType = (assetType) => {
-                if (!deratingOn) return 1;
-                const col = ASSET_TYPE_TO_OUTAGE_COL[assetType];
-                if (!col || !outageFactors[col]) return 1;
-                if (repFactorCache[col] === undefined) {
-                    const arr = outageFactors[col];
-                    let s = 0; for (let i = 0; i < arr.length; i++) s += arr[i];
-                    repFactorCache[col] = arr.length ? s / arr.length : 1;
-                }
-                return repFactorCache[col];
-            };
-
+            
             // Binning optimization: Group assets into cost buckets to reduce chart data points
             // This prevents Chart.js from choking on thousands of individual assets
             const BIN_SIZE = 0.50; // $0.50 increments
@@ -9720,8 +9314,8 @@
                     bins[fuel][binKey] = { cost: binKey, capacity: 0, assets: [] };
                 }
                 
-                // Add asset to bin (capacity scaled by representative availability when derating is active)
-                bins[fuel][binKey].capacity += asset.Capacity_MW * repFactorForType(asset.Asset_Type);
+                // Add asset to bin
+                bins[fuel][binKey].capacity += asset.Capacity_MW;
                 bins[fuel][binKey].assets.push(asset);
             });
             
@@ -9778,7 +9372,7 @@
             const yMaxValue = yMaxInput && yMaxInput.value ? parseFloat(yMaxInput.value) : null;
             const yScaleConfig = { title: { display: true, text: 'Marginal Cost ($/MWh)' } };
             if (yMaxValue && yMaxValue > 0) { yScaleConfig.max = yMaxValue; }
-            dispatchCurveChart = new Chart(ctx, { type: 'line', data: { datasets: Object.values(datasetsByFuel) }, options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: 'top', labels: {boxWidth: 12} }, tooltip: { callbacks: { title: (items) => items[0].raw.asset.Asset_Name, label: (item) => `Cost: $${item.raw.y.toFixed(2)}/MWh`, footer: (items) => `Type: ${items[0].raw.asset.Asset_Type}` } } }, scales: { x: { type: 'linear', title: { display: true, text: deratingOn ? 'Cumulative Capacity (MW) — derated (annual avg)' : 'Cumulative Capacity (MW)' } }, y: yScaleConfig } } });
+            dispatchCurveChart = new Chart(ctx, { type: 'line', data: { datasets: Object.values(datasetsByFuel) }, options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: 'top', labels: {boxWidth: 12} }, tooltip: { callbacks: { title: (items) => items[0].raw.asset.Asset_Name, label: (item) => `Cost: $${item.raw.y.toFixed(2)}/MWh`, footer: (items) => `Type: ${items[0].raw.asset.Asset_Type}` } } }, scales: { x: { type: 'linear', title: { display: true, text: 'Cumulative Capacity (MW)' } }, y: yScaleConfig } } });
         }
         function updateDiurnalMixChart(hourlyGeneration, hourlyPrices, rawPrices, historicalPrices) { 
             const hourlyAvgs = Array.from({ length: 24 }, () => ({})); const avgPrices = Array(24).fill(0); const avgRawPrices = Array(24).fill(0); const avgHistoricalPrices = Array(24).fill(0);
