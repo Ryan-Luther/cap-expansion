@@ -16,7 +16,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Capacity Expansion Model - Prism Style (Smart Drop Fixed)</title>
+    <title>PJM Capacity Expansion - Reliability Backstop Procurement</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.3.2/papaparse.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
@@ -331,6 +331,24 @@
                                 <div><label for="energy-price-cap" class="label-with-info text-[10px] text-prism-muted mb-1">Energy Price Cap<span class="info-tooltip">i<span class="tooltip-text">Maximum energy price in $/MWh. Caps hourly energy prices to prevent extreme values. Default: $5000/MWh. Typical range: $1000-$9999.</span></span></label><input type="number" id="energy-price-cap" name="energy-price-cap" value="5000" step="100" class="financial-input"></div>
                                 <div><label for="elcc-peak-hours" class="label-with-info text-[10px] text-prism-muted mb-1">ELCC Peak Hrs<span class="info-tooltip">i<span class="tooltip-text">Number of peak load hours used to calculate ELCC (Effective Load Carrying Capability). Average generation during these top load hours divided by installed capacity. Default: 100.</span></span></label><input type="number" id="elcc-peak-hours" name="elcc-peak-hours" value="100" step="1" min="1" class="financial-input"></div>
                             </div>
+
+                            <h2 class="text-[10px] font-bold text-prism-green uppercase mb-2 mt-4 tracking-wider border-t border-prism-border pt-2">Reliability Backstop Procurement</h2>
+                            <p class="text-[9px] text-prism-muted/70 mb-2 leading-snug">
+                                Procured blocks are added to installed capacity (they dispatch and suppress energy prices)
+                                <em>and</em> bid <span class="text-prism-green font-bold">$0</span> as price takers into every BRA
+                                for a <span class="font-mono">15</span>-year term, per the RPM must-offer in FERC Docket ER26-3380.
+                                ICAP is converted to UCAP at a fixed <span class="font-mono">0.79</span> accreditation factor
+                                (PJM 2028/29 Reference Resource: $256.75/MW-ICAP = $325.00/MW-UCAP).
+                                Filed target 6,831 MW UCAP = <span class="font-mono">8.65 GW ICAP</span>.
+                            </p>
+                            <div class="grid grid-cols-3 gap-2 mb-2">
+                                <div><label for="rbp-auctions" class="label-with-info text-[10px] text-prism-muted mb-1">Auctions<span class="info-tooltip">i<span class="tooltip-text">Number of RBP procurements to model, 0-5. Each clears in a successive delivery year starting at the first delivery year below. The filed RBP is a single one-time procurement; more than one implies PJM repeats it (the OATT Att. DD Sec. 16 Reliability Backstop Auction triggers automatically after three consecutive BRAs clearing >1pp below IRM).</span></span></label><input type="number" id="rbp-auctions" name="rbp-auctions" value="3" min="0" max="5" step="1" class="financial-input"></div>
+                                <div><label for="rbp-start-year" class="label-with-info text-[10px] text-prism-muted mb-1">1st Del. Yr<span class="info-tooltip">i<span class="tooltip-text">Delivery year in which the first auction's capacity first appears in the BRA supply stack. Default 2030. The filed commitment term starts DY2028/29 and requires COD no later than June 1, 2032, so 2030 sits inside the tariff window but ahead of when reformed Cycle 1 CODs realistically land (2031+). Subsequent auctions deliver in consecutive years.</span></span></label><input type="number" id="rbp-start-year" name="rbp-start-year" value="2030" min="2026" max="2060" step="1" class="financial-input"></div>
+                                <div><label for="rbp-tech" class="label-with-info text-[10px] text-prism-muted mb-1">Resource<span class="info-tooltip">i<span class="tooltip-text">Technology the procured ICAP is added to for dispatch. Sets heat rate, fuel burn and energy revenue. Gas CCGT is the default; RBP eligibility is new build, uprates or repowering of deactivated units.</span></span></label><select id="rbp-tech" name="rbp-tech" class="financial-input"><option value="new-gas-ccgt">Gas CCGT</option><option value="new-gas-ct">Gas CT</option><option value="storage">Storage</option></select></div>
+                            </div>
+                            <label class="text-[10px] text-prism-muted mb-1 block">ICAP procured per auction (GW)</label>
+                            <div id="rbp-gw-grid" class="grid grid-cols-5 gap-1 mb-2"></div>
+                            <div id="rbp-summary" class="text-[9px] font-mono text-prism-muted/80 leading-snug"></div>
                         </div>
                     </div>
                 </div>
@@ -3889,7 +3907,8 @@
                     recCapThreshold: (parseFloat(getInputVal('rec-cap-threshold', 75)) || 75) / 100,
                     recFloorThreshold: (parseFloat(getInputVal('rec-floor-threshold', 100)) || 100) / 100,
                     energyPriceCap: parseFloat(getInputVal('energy-price-cap', 5000)) || 5000,
-                    elccPeakHours: parseInt(getInputVal('elcc-peak-hours', 100)) || 100
+                    elccPeakHours: parseInt(getInputVal('elcc-peak-hours', 100)) || 100,
+                    year: year   // delivery year, so the RBP overlay resolves the right blocks
                 };
 
                 let installedCapacities = {};
@@ -5146,8 +5165,13 @@
             yearSel.innerHTML = '<option value="">Year...</option>';
 
             // Sort once for reuse
-            const sortedIsos = Array.from(isoSet).sort();
+            // PJM-ONLY BUILD: this workbook models the PJM Reliability Backstop Procurement,
+            // so the ISO universe is locked to PJM regardless of what the loaded files contain.
+            const sortedIsos = Array.from(isoSet).filter(iso => /pjm/i.test(iso)).sort();
             const sortedYears = Array.from(yearSet).sort();
+            if (sortedIsos.length === 0 && isoSet.size > 0) {
+                showNotification('No PJM data found in the loaded files. This build is PJM-only.', true);
+            }
 
             sortedIsos.forEach(iso => {
                 const opt = document.createElement('option');
@@ -7199,6 +7223,20 @@
                     updatePriceMetricsDisplay();
                 }
             });
+            // ── Reliability Backstop Procurement controls ────────────────────────────
+            renderRbpControls();
+            document.getElementById('yearSelector').addEventListener('change', renderRbpControls);
+            ['rbp-auctions', 'rbp-start-year', 'rbp-tech'].forEach(id => {
+                document.getElementById(id)?.addEventListener('input', renderRbpControls);
+            });
+            // The resource <select> and the dynamically created GW inputs are not covered by
+            // the generic number/range wiring below, so re-run the model on change explicitly.
+            const _rbpRerun = async () => {
+                if (hourlyData.length > 0 && dispatchAssets.length > 0) await runModel();
+            };
+            document.getElementById('rbp-tech')?.addEventListener('change', _rbpRerun);
+            document.getElementById('rbp-gw-grid')?.addEventListener('change', _rbpRerun);
+
             document.querySelectorAll('input[type="range"], input[type="number"]').forEach(i => {
                 i.addEventListener('input', () => { if(i.type === 'range') updateSliderValue(i.id); });
                 i.addEventListener('change', async () => { if(hourlyData.length > 0 && dispatchAssets.length > 0) await runModel(); });
@@ -7454,6 +7492,16 @@
              document.getElementById('import-intercept').value = 0.0;
              if(document.getElementById('tx-margin-input')) document.getElementById('tx-margin-input').value = 15.0;
              document.getElementById('tx-suppression').value = 1.0;
+             // Reliability Backstop Procurement: back to the base case — three auctions
+             // of gas CC delivering DY2030/31/32 at 8.65 / 5 / 7 GW ICAP.
+             document.getElementById('rbp-auctions').value = 3;
+             document.getElementById('rbp-start-year').value = 2030;
+             document.getElementById('rbp-tech').value = 'new-gas-ccgt';
+             for (let i = 0; i < RBP_MAX_AUCTIONS; i++) {
+                 const el = document.getElementById(`rbp-gw-${i}`);
+                 if (el) el.value = RBP_DEFAULT_GW[i];
+             }
+             renderRbpControls();
              generationTypes.forEach(t => {
                  const slider = document.getElementById(`${t.id}-slider`);
                  if (slider) { if (etrCapacities[t.id] !== undefined) slider.value = etrCapacities[t.id]; else slider.value = t.value; updateSliderValue(`${t.id}-slider`); }
@@ -7978,6 +8026,16 @@
                 });
             }
             
+            // 1b. Reliability Backstop Procurement overlay.
+            // Stamp the delivery year onto conf so calculateMarketMetrics resolves the right
+            // RBP blocks, then add the procured ICAP to the dispatch stack. Guarded so it is
+            // applied exactly once even if a caller passes an already-adjusted config.
+            if (!conf._rbpApplied) {
+                const _rbpYear = conf.year ?? document.getElementById('yearSelector')?.value;
+                conf = { ...conf, year: _rbpYear, _rbpApplied: true };
+                installedCapacities = applyRbpToCapacities(installedCapacities, _rbpYear);
+            }
+
             // 2. Optimization: Pre-calculate hourly gas prices (from copilot branch)
             // This relies on the helper function you created in the "Vectorize Gas Price Scalars" step
             const hourlyGasPrices = preCalculateHourlyGasPrices(conf.gasCost);
@@ -8295,7 +8353,111 @@
             }
         }
 
+        // ═══ RELIABILITY BACKSTOP PROCUREMENT (RBP) ═══════════════════════════════════
+        // PJM's RBP (FERC Docket ER26-3380, filed July 31, 2026) procures NEW capacity on a
+        // fixed 15-year term. Committed resources carry an RPM must-offer at $0 (price
+        // takers) for every delivery year of the term, so they enter the BRA supply stack
+        // at the very bottom and push the marginal price-setting offer down the curve.
+        //
+        // Filed Initial RBP Target = 6,831.3 MW UCAP, mechanically equal to the observed
+        // 2028/29 BRA shortfall. At the 0.79 Reference Resource accreditation factor
+        // implied by that auction's cap ($256.75/MW-ICAP = $325.00/MW-UCAP) this is
+        // ~8,647 MW ICAP, i.e. the 8.65 GW default in the first auction slot.
+        const RBP_ACCRED_FACTOR = 0.79;  // fixed ICAP -> UCAP
+        const RBP_TERM_YEARS    = 15;    // fixed term as filed (DY2028/29 -> DY2042/43)
+        const RBP_MAX_AUCTIONS  = 5;
+        // Base-case ICAP GW per auction. A1 = the filed 8.65 GW target (6,831 MW UCAP);
+        // A2/A3 are sized to the residual gap net of organic entry. A4/A5 are 0 — raise
+        // the auction count and they become editable, but they need explicit values.
+        const RBP_DEFAULT_GW = [8.65, 5, 7, 0, 0];
+
+        function readRbpInputs() {
+            const n = Math.max(0, Math.min(RBP_MAX_AUCTIONS,
+                parseInt(document.getElementById('rbp-auctions')?.value) || 0));
+            const startYear = parseInt(document.getElementById('rbp-start-year')?.value) || 2031;
+            const techId    = document.getElementById('rbp-tech')?.value || 'new-gas-ccgt';
+            const gw = [];
+            for (let i = 0; i < RBP_MAX_AUCTIONS; i++) {
+                gw.push(parseFloat(document.getElementById(`rbp-gw-${i}`)?.value) || 0);
+            }
+            return { n, startYear, techId, gw };
+        }
+
+        // Blocks delivering in `year`. Auction i delivers from startYear+i and keeps its
+        // $0 must-offer for RBP_TERM_YEARS, so commitments accumulate year over year.
+        function rbpBlocksForYear(year) {
+            const y = parseInt(year);
+            if (!y) return [];
+            const { n, startYear, techId, gw } = readRbpInputs();
+            const blocks = [];
+            for (let i = 0; i < n; i++) {
+                const dy = startYear + i;
+                if (y >= dy && y < dy + RBP_TERM_YEARS && gw[i] > 0) {
+                    const icapMW = gw[i] * 1000;
+                    blocks.push({
+                        auction: i + 1, deliveryYear: dy, techId,
+                        icapMW, ucapMW: icapMW * RBP_ACCRED_FACTOR
+                    });
+                }
+            }
+            return blocks;
+        }
+
+        const rbpIcapMWForYear = (year, techId) => rbpBlocksForYear(year)
+            .filter(b => !techId || b.techId === techId)
+            .reduce((s, b) => s + b.icapMW, 0);
+
+        // Add procured ICAP to the dispatch stack so the blocks physically generate.
+        // Returns a copy — never mutates a shared capacities object.
+        function applyRbpToCapacities(caps, year) {
+            const out = { ...caps };
+            rbpBlocksForYear(year).forEach(b => {
+                out[b.techId] = (out[b.techId] || 0) + b.icapMW;
+            });
+            return out;
+        }
+
+        function renderRbpControls() {
+            const grid = document.getElementById('rbp-gw-grid');
+            if (!grid) return;
+            if (!grid.dataset.built) {
+                grid.innerHTML = Array.from({ length: RBP_MAX_AUCTIONS }, (_, i) =>
+                    `<div><label for="rbp-gw-${i}" class="text-[9px] text-prism-muted/70 block text-center">A${i + 1}</label>` +
+                    `<input type="number" id="rbp-gw-${i}" name="rbp-gw-${i}" value="${RBP_DEFAULT_GW[i]}" min="0" step="0.1" class="financial-input text-center"></div>`
+                ).join('');
+                grid.dataset.built = '1';
+                grid.querySelectorAll('input').forEach(el => el.addEventListener('input', renderRbpControls));
+            }
+            const { n, startYear, gw } = readRbpInputs();
+            for (let i = 0; i < RBP_MAX_AUCTIONS; i++) {
+                const el = document.getElementById(`rbp-gw-${i}`);
+                if (!el) continue;
+                const active = i < n;
+                el.disabled = !active;
+                el.parentElement.style.opacity = active ? '1' : '0.35';
+                el.previousElementSibling.textContent = active ? `DY${startYear + i}` : `A${i + 1}`;
+            }
+            const totIcap = gw.slice(0, n).reduce((s, v) => s + v, 0);
+            const yr = document.getElementById('yearSelector')?.value;
+            const live = rbpBlocksForYear(yr);
+            const liveIcap = live.reduce((s, b) => s + b.icapMW, 0) / 1000;
+            const sum = document.getElementById('rbp-summary');
+            if (sum) {
+                sum.innerHTML = n === 0
+                    ? 'No RBP modeled — BRA clears on the unmodified supply stack.'
+                    : `${n} auction${n > 1 ? 's' : ''} &middot; ${totIcap.toFixed(2)} GW ICAP ` +
+                      `= ${(totIcap * RBP_ACCRED_FACTOR).toFixed(2)} GW UCAP total<br>` +
+                      `DY${startYear}&ndash;DY${startYear + n + RBP_TERM_YEARS - 2} committed &middot; ` +
+                      (yr ? `<span class="text-prism-green">${yr}: ${liveIcap.toFixed(2)} GW ICAP ` +
+                            `(${(liveIcap * RBP_ACCRED_FACTOR).toFixed(2)} GW UCAP) bidding $0</span>`
+                          : 'select a year to see live blocks');
+            }
+        }
+
         function calculateMarketMetrics(modelResults, installedCapacities, conf) {
+            // Delivery year for RBP block lookup. conf.year is set by the main run paths;
+            // fall back to the selector for headless/worker calls.
+            const _rbpYear = parseInt(conf.year ?? document.getElementById('yearSelector')?.value) || 0;
             const prmTarget = conf.prmTarget;
             const rpsTarget = conf.rpsTarget;
             const capPriceCap = conf.capPriceCap;
@@ -8609,7 +8771,10 @@
                 }
 
                 // Committed new builds and potential bids (all buildable techs, including zero-capacity)
-                const newBuildMW = Math.max(0, totalMW - existingMW);
+                // RBP-procured MW was added to installedCapacities so it dispatches, but it must not
+                // also bid here at Net CONE — it is represented exactly once, below, as a $0 step.
+                const rbpMWthisTech = rbpIcapMWForYear(_rbpYear, tech.id);
+                const newBuildMW = Math.max(0, totalMW - existingMW - rbpMWthisTech);
                 if (canBuildNew) {
                     const hurdle      = (parseFloat(document.getElementById(`hurdle-${tech.id}`)?.value) || 7) / 100;
                     const life        = parseInt(document.getElementById(`life-${tech.id}`)?.value) || 25;
@@ -8644,6 +8809,23 @@
                     }
                 }
             });
+
+            // RBP blocks bid $0 as price takers for every year of their 15-year term.
+            // They sort to the bottom of the stack and displace the marginal offer upward
+            // along the VRR curve, which is the whole mechanism of capacity-price suppression.
+            const rbpSteps = rbpBlocksForYear(_rbpYear).map(b => ({
+                techId: 'rbp',
+                techName: `RBP A${b.auction} (DY${b.deliveryYear})`,
+                color: '#22d3ee',
+                segment: 'rbp',
+                accreditedMW: b.ucapMW,
+                offerPrice: 0
+            }));
+            supplySteps.push(...rbpSteps);
+            if (rbpSteps.length) {
+                console.log(`[RBP] ${_rbpYear}: ${rbpSteps.length} block(s), ` +
+                    `${(rbpSteps.reduce((s, r) => s + r.accreditedMW, 0) / 1000).toFixed(2)} GW UCAP at $0`);
+            }
 
             // Sort supply steps by offer price ascending (cheapest units offered first)
             supplySteps.sort((a, b) => a.offerPrice - b.offerPrice);
